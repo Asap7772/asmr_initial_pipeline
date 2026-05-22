@@ -1,0 +1,915 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import gc
+import json
+import logging
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import torch
+from tqdm import tqdm
+
+try:
+    from retrieval.answer_proc_heldout import (
+        answer_records,
+        load_env_file,
+        resolve_reasoning_arg,
+    )
+    from retrieval.retrieve_proc_heldout import (
+        DEFAULT_DOCS_DIR,
+        DEFAULT_GOLD_AND_SUPPORT_ONLY,
+        DEFAULT_PRIVILEGED_DIR,
+        DEFAULT_QUESTIONS_PATH,
+        CandidateDocument,
+        Qwen3EmbeddingVllm,
+        batches,
+        load_candidate_documents,
+        load_heldout_questions,
+        maybe_normalize,
+        select_questions,
+        write_jsonl,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name not in {
+        "retrieval",
+        "retrieval.answer_proc_heldout",
+        "retrieval.retrieve_proc_heldout",
+    }:
+        raise
+    from answer_proc_heldout import (
+        answer_records,
+        load_env_file,
+        resolve_reasoning_arg,
+    )
+    from retrieve_proc_heldout import (
+        DEFAULT_DOCS_DIR,
+        DEFAULT_GOLD_AND_SUPPORT_ONLY,
+        DEFAULT_PRIVILEGED_DIR,
+        DEFAULT_QUESTIONS_PATH,
+        CandidateDocument,
+        Qwen3EmbeddingVllm,
+        batches,
+        load_candidate_documents,
+        load_heldout_questions,
+        maybe_normalize,
+        select_questions,
+        write_jsonl,
+    )
+
+try:
+    from inference.collect_llm import (
+        ReasoningEffort,
+        create_async_client,
+        generate_response,
+        get_provider_config,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name not in {"inference", "inference.collect_llm"}:
+        raise
+    import sys
+
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
+    from inference.collect_llm import (
+        ReasoningEffort,
+        create_async_client,
+        generate_response,
+        get_provider_config,
+    )
+
+
+logger = logging.getLogger(__name__)
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_AGENT_PROMPT_PATH = REPO_ROOT / "retrieval" / "agentic_rag_query.md"
+DEFAULT_RETRIEVAL_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_agentic_retrieval_gemini.jsonl"
+DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_agentic_answers_gemini.jsonl"
+DEFAULT_NON_LOCAL_ANSWERER=True
+
+@dataclass(frozen=True)
+class SearchHit:
+    document: CandidateDocument
+    score: float
+    rank: int
+    query: str
+    iteration: int
+
+
+@dataclass
+class AggregatedDocument:
+    document: CandidateDocument
+    best_score: float
+    best_rank: int
+    best_query: str
+    first_seen_iteration: int
+    hit_count: int = 0
+    seen_queries: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class AgentAction:
+    action: str
+    thought: str
+    query: str | None
+    document_paths: list[str]
+    raw_response: str
+    parse_error: str | None = None
+
+
+class QuestionRetrievalIndex:
+    def __init__(
+        self,
+        model: Qwen3EmbeddingVllm,
+        documents: list[CandidateDocument],
+        *,
+        dim: int,
+        batch_size: int,
+        normalize: bool,
+    ) -> None:
+        self.model = model
+        self.documents = documents
+        self.dim = dim
+        self.normalize = normalize
+        self.doc_embeddings = self._embed_documents(batch_size)
+
+    def _embed_documents(self, batch_size: int) -> torch.Tensor | None:
+        if not self.documents:
+            return None
+
+        doc_embeddings: list[torch.Tensor] = []
+        with torch.inference_mode():
+            for batch in batches(self.documents, batch_size):
+                embeddings = self.model.encode([doc.text for doc in batch], dim=self.dim)
+                doc_embeddings.append(maybe_normalize(embeddings, self.normalize))
+        return torch.cat(doc_embeddings, dim=0)
+
+    def search(self, query: str, *, top_k: int, iteration: int) -> list[SearchHit]:
+        if self.doc_embeddings is None or not self.documents:
+            return []
+
+        with torch.inference_mode():
+            query_embedding = self.model.encode(query, is_query=True, dim=self.dim)
+            query_embedding = maybe_normalize(query_embedding, self.normalize)
+            scores = ((query_embedding @ self.doc_embeddings.T).squeeze(0) * 100).detach().cpu()
+
+        k = min(top_k, len(self.documents))
+        top_scores, top_indices = torch.topk(scores, k=k)
+        return [
+            SearchHit(
+                document=self.documents[index],
+                score=float(score),
+                rank=rank,
+                query=query,
+                iteration=iteration,
+            )
+            for rank, (score, index) in enumerate(
+                zip(top_scores.tolist(), top_indices.tolist()),
+                start=1,
+            )
+        ]
+
+
+class AgenticQueryPlanner:
+    def __init__(
+        self,
+        provider: str,
+        model_name: str,
+        *,
+        max_completion_tokens: int,
+        reasoning_effort: ReasoningEffort,
+        use_cache: bool,
+    ) -> None:
+        self.config = get_provider_config(provider)
+        self.model_name = model_name or self.config.default_model
+        self.client = create_async_client(self.config)
+        self.max_completion_tokens = max_completion_tokens
+        self.reasoning_effort = reasoning_effort
+        self.use_cache = use_cache
+
+    def propose(self, prompt: str) -> str:
+        responses = asyncio.run(
+            generate_response(
+                self.client,
+                prompt,
+                N=1,
+                max_completion_tokens=self.max_completion_tokens,
+                reasoning_effort=self.reasoning_effort,
+                use_cache=self.use_cache,
+                model_name=self.model_name,
+                provider=self.config,
+            )
+        )
+        return responses[0] if responses else ""
+
+    def stop(self) -> None:
+        try:
+            asyncio.run(self.client.close())
+        except Exception:
+            pass
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run agentic query expansion RAG, then answer and judge heldout questions."
+    )
+    parser.add_argument("--questions-path", type=Path, default=DEFAULT_QUESTIONS_PATH)
+    parser.add_argument("--docs-dir", type=Path, default=DEFAULT_DOCS_DIR)
+    parser.add_argument("--privileged-dir", type=Path, default=DEFAULT_PRIVILEGED_DIR)
+    parser.add_argument("--retrieval-output-path", type=Path, default=DEFAULT_RETRIEVAL_OUTPUT_PATH)
+    parser.add_argument("--output-path", type=Path, default=DEFAULT_OUTPUT_PATH)
+
+    parser.add_argument("--agent-prompt-path", type=Path, default=DEFAULT_AGENT_PROMPT_PATH)
+    parser.add_argument("--agent-provider", default="gemini")
+    parser.add_argument("--agent-model-name", default="")
+    parser.add_argument("--agent-max-completion-tokens", type=int, default=1024)
+    parser.add_argument(
+        "--agent-reasoning-effort",
+        default="provider_default",
+        help="Use 'none', 'provider_default', or a provider-supported effort value.",
+    )
+    parser.add_argument(
+        "--agent-use-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Cache query-planner responses through inference.collect_llm.",
+    )
+    parser.add_argument("--max-iterations", type=int, default=4)
+    parser.add_argument("--search-top-k", type=int, default=10)
+    parser.add_argument("--final-top-k", type=int, default=20)
+    parser.add_argument("--agent-observation-docs", type=int, default=5)
+    parser.add_argument("--agent-context-docs", type=int, default=12)
+    parser.add_argument("--agent-max-snippet-chars", type=int, default=900)
+    parser.add_argument("--agent-extended-relevance", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--agent-enforce-top-k", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--initial-search", action=argparse.BooleanOptionalAction, default=True)
+
+    parser.add_argument("--embedding-model-name-or-path", default="Qwen/Qwen3-Embedding-4B")
+    parser.add_argument("--embedding-instruction", default=None)
+    parser.add_argument("--embedding-dim", type=int, default=1024)
+    parser.add_argument("--embedding-batch-size", type=int, default=128)
+    parser.add_argument("--embedding-tensor-parallel-size", type=int, default=None)
+    parser.add_argument("--embedding-max-model-len", type=int, default=None)
+    parser.add_argument("--embedding-gpu-memory-utilization", type=float, default=None)
+    parser.add_argument("--normalize", action="store_true")
+    parser.add_argument("--max-doc-chars", type=int, default=30_000)
+    parser.add_argument(
+        "--gold-and-support-only",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_GOLD_AND_SUPPORT_ONLY,
+    )
+    parser.add_argument("--no-text", action="store_true", help="Omit document text from retrieval JSONL.")
+
+    parser.add_argument("--skip-answer", action="store_true")
+    parser.add_argument(
+        "--non-local-answerer",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_NON_LOCAL_ANSWERER,
+    )
+    parser.add_argument("--provider", default="gemini")
+    parser.add_argument(
+        "--model-name-or-path",
+        default="",
+        help="Defaults to Qwen locally, or the selected provider's default for --non-local-answerer.",
+    )
+    parser.add_argument("--max-concurrent", type=int, default=8)
+    parser.add_argument("--answer-reasoning-effort", default="provider_default")
+    parser.add_argument("--answer-use-cache", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--tensor-parallel-size", type=int, default=None)
+    parser.add_argument("--distributed-executor-backend", default=None)
+    parser.add_argument("--max-model-len", type=int, default=32768)
+    parser.add_argument("--max-prompt-tokens", type=int, default=30000)
+    parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--dtype", default="auto")
+    parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--top-k", type=int, default=-1)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--top-docs", type=int, default=10)
+    parser.add_argument("--answer-max-doc-chars", type=int, default=12_000)
+    parser.add_argument("--min-doc-chars", type=int, default=800)
+    parser.add_argument("--n", type=int, default=1)
+    parser.add_argument("--judge", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--judge-provider", default="gemini")
+    parser.add_argument("--judge-model-name", default="")
+    parser.add_argument("--judge-max-concurrent", type=int, default=4)
+    parser.add_argument("--judge-max-completion-tokens", type=int, default=64)
+    parser.add_argument("--judge-reasoning-effort", default="none")
+    parser.add_argument("--judge-use-cache", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--disable-thinking", action=argparse.BooleanOptionalAction, default=True)
+
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--query-id", action="append", default=None)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--log-level", default="INFO")
+    args = parser.parse_args()
+
+    if args.max_iterations < 0:
+        parser.error("--max-iterations must be >= 0")
+    if args.search_top_k < 1:
+        parser.error("--search-top-k must be at least 1")
+    if args.final_top_k < 1:
+        parser.error("--final-top-k must be at least 1")
+    if args.agent_observation_docs < 1:
+        parser.error("--agent-observation-docs must be at least 1")
+    if args.agent_context_docs < 1:
+        parser.error("--agent-context-docs must be at least 1")
+    if args.agent_max_snippet_chars < 0:
+        parser.error("--agent-max-snippet-chars must be >= 0")
+    if args.embedding_batch_size < 1:
+        parser.error("--embedding-batch-size must be at least 1")
+    if args.max_doc_chars < 0:
+        parser.error("--max-doc-chars must be >= 0")
+    if args.gold_and_support_only and args.privileged_dir is None:
+        parser.error("--gold-and-support-only requires --privileged-dir")
+    return args
+
+
+def render_agent_template(
+    path: Path,
+    *,
+    extended_relevance: bool,
+    enforce_top_k: bool,
+    top_k: int,
+    with_init_docs: bool,
+) -> str:
+    template = path.read_text(encoding="utf-8")
+    context = {
+        "extended_relevance": extended_relevance,
+        "enforce_top_k": enforce_top_k,
+        "top_k": top_k,
+        "with_init_docs": with_init_docs,
+    }
+
+    try:
+        from jinja2 import Template
+
+        return Template(template).render(**context).strip()
+    except Exception:
+        return render_tiny_jinja(template, context).strip()
+
+
+def render_tiny_jinja(template: str, context: dict[str, Any]) -> str:
+    pattern = re.compile(r"{%-?\s*if\s+(\w+)\s*-?%}(.*?){%-?\s*endif\s*-?%}", flags=re.DOTALL)
+    rendered = template
+    while True:
+        match = pattern.search(rendered)
+        if match is None:
+            break
+        key, body = match.group(1), match.group(2)
+        rendered = rendered[: match.start()] + (body if context.get(key) else "") + rendered[match.end() :]
+
+    def replace_var(match: re.Match[str]) -> str:
+        return str(context.get(match.group(1), ""))
+
+    rendered = re.sub(r"{{\s*(\w+)\s*}}", replace_var, rendered)
+    rendered = re.sub(r"{#.*?#}", "", rendered, flags=re.DOTALL)
+    return rendered
+
+
+def render_messages_for_planner(system_prompt: str, user_prompt: str) -> str:
+    return f"SYSTEM:\n{system_prompt.strip()}\n\nUSER:\n{user_prompt.strip()}".strip()
+
+
+def compact_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_title(text: str) -> str:
+    for line in text.splitlines()[:12]:
+        stripped = line.strip()
+        if stripped.lower().startswith("title:"):
+            return stripped.split(":", 1)[1].strip()
+    return ""
+
+
+def truncate_text(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    text = compact_whitespace(text)
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= 3:
+        return text[:max_chars]
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def hit_to_observation(hit: SearchHit, *, max_snippet_chars: int) -> dict[str, Any]:
+    doc = hit.document
+    observation: dict[str, Any] = {
+        "rank": hit.rank,
+        "score": hit.score,
+        "path": doc.rel_path,
+        "filename": doc.path.name,
+    }
+    if doc.metadata.get("label") is not None:
+        observation["label"] = doc.metadata["label"]
+    title = extract_title(doc.text)
+    if title:
+        observation["title"] = title
+    snippet = truncate_text(doc.text, max_snippet_chars)
+    if snippet:
+        observation["snippet"] = snippet
+    return observation
+
+
+def aggregated_to_observation(doc: AggregatedDocument, *, max_snippet_chars: int) -> dict[str, Any]:
+    candidate = doc.document
+    observation: dict[str, Any] = {
+        "path": candidate.rel_path,
+        "filename": candidate.path.name,
+        "best_score": doc.best_score,
+        "best_search_rank": doc.best_rank,
+        "first_seen_iteration": doc.first_seen_iteration,
+        "hit_count": doc.hit_count,
+        "best_query": doc.best_query,
+    }
+    title = extract_title(candidate.text)
+    if title:
+        observation["title"] = title
+    snippet = truncate_text(candidate.text, max_snippet_chars)
+    if snippet:
+        observation["snippet"] = snippet
+    return observation
+
+
+def build_planner_prompt(
+    system_prompt: str,
+    *,
+    question: str,
+    search_steps: list[dict[str, Any]],
+    aggregate: dict[str, AggregatedDocument],
+    iteration: int,
+    args: argparse.Namespace,
+) -> str:
+    ranked_candidates = rank_aggregated_documents(aggregate)[: args.agent_context_docs]
+    user_payload = {
+        "question": question,
+        "iteration": iteration,
+        "max_iterations": args.max_iterations,
+        "search_top_k": args.search_top_k,
+        "final_top_k": args.final_top_k,
+        "previous_searches": search_steps,
+        "best_candidate_documents": [
+            aggregated_to_observation(doc, max_snippet_chars=args.agent_max_snippet_chars)
+            for doc in ranked_candidates
+        ],
+    }
+    user_prompt = f"""
+Use the retrieval history below to decide the next tool call.
+
+Available tools:
+1. search: retrieve documents for one new query.
+2. final_results: stop and choose the final document paths.
+
+Return only valid JSON, with one of these shapes:
+{{"thought": "brief reason", "action": "search", "query": "new dense-retrieval query"}}
+{{"thought": "brief reason", "action": "final_results", "document_paths": ["path/a.txt", "path/b.txt"]}}
+
+Do not answer the question. Search queries should be specific, diverse, and useful for finding missing evidence.
+
+PAYLOAD:
+{json.dumps(user_payload, ensure_ascii=False, indent=2)}
+"""
+    return render_messages_for_planner(system_prompt, user_prompt)
+
+
+def strip_code_fence(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
+    stripped = re.sub(r"\s*```$", "", stripped)
+    return stripped.strip()
+
+
+def parse_jsonish(text: str) -> Any:
+    stripped = strip_code_fence(text)
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", stripped, flags=re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+    raise ValueError("response did not contain valid JSON")
+
+
+def normalize_document_paths(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+
+    paths: list[str] = []
+    for item in value:
+        if isinstance(item, str):
+            candidate = item.strip()
+        elif isinstance(item, dict):
+            candidate = str(
+                item.get("path")
+                or item.get("document_path")
+                or item.get("filename")
+                or item.get("docid")
+                or ""
+            ).strip()
+        else:
+            candidate = ""
+        if candidate:
+            paths.append(candidate)
+    return paths
+
+
+def parse_agent_action(raw_response: str) -> AgentAction:
+    try:
+        parsed = parse_jsonish(raw_response)
+        if not isinstance(parsed, dict):
+            raise ValueError("top-level JSON is not an object")
+        action = str(parsed.get("action", "")).strip().lower()
+        if action in {"final", "finish", "final_result"}:
+            action = "final_results"
+        if action not in {"search", "final_results"}:
+            raise ValueError(f"unsupported action: {action!r}")
+        query = parsed.get("query") or parsed.get("search_query")
+        document_paths = normalize_document_paths(
+            parsed.get("document_paths")
+            or parsed.get("documents")
+            or parsed.get("results")
+            or []
+        )
+        return AgentAction(
+            action=action,
+            thought=str(parsed.get("thought", parsed.get("reason", ""))).strip(),
+            query=str(query).strip() if query is not None else None,
+            document_paths=document_paths,
+            raw_response=raw_response,
+        )
+    except Exception as exc:
+        return AgentAction(
+            action="final_results",
+            thought="Could not parse planner response; falling back to ranked retrieved documents.",
+            query=None,
+            document_paths=[],
+            raw_response=raw_response,
+            parse_error=str(exc),
+        )
+
+
+def normalized_query(query: str) -> str:
+    return compact_whitespace(query).lower()
+
+
+def add_hits_to_aggregate(aggregate: dict[str, AggregatedDocument], hits: list[SearchHit]) -> None:
+    for hit in hits:
+        key = hit.document.rel_path
+        existing = aggregate.get(key)
+        if existing is None:
+            aggregate[key] = AggregatedDocument(
+                document=hit.document,
+                best_score=hit.score,
+                best_rank=hit.rank,
+                best_query=hit.query,
+                first_seen_iteration=hit.iteration,
+                hit_count=1,
+                seen_queries=[hit.query],
+            )
+            continue
+
+        existing.hit_count += 1
+        if hit.query not in existing.seen_queries:
+            existing.seen_queries.append(hit.query)
+        if hit.score > existing.best_score:
+            existing.best_score = hit.score
+            existing.best_rank = hit.rank
+            existing.best_query = hit.query
+
+
+def rank_aggregated_documents(aggregate: dict[str, AggregatedDocument]) -> list[AggregatedDocument]:
+    return sorted(
+        aggregate.values(),
+        key=lambda doc: (
+            doc.best_score,
+            doc.hit_count,
+            -doc.best_rank,
+            -doc.first_seen_iteration,
+        ),
+        reverse=True,
+    )
+
+
+def resolve_selected_documents(
+    aggregate: dict[str, AggregatedDocument],
+    selected_paths: list[str],
+    *,
+    final_top_k: int,
+) -> list[AggregatedDocument]:
+    by_path = {doc.document.rel_path: doc for doc in aggregate.values()}
+    by_filename = {doc.document.path.name: doc for doc in aggregate.values()}
+    selected: list[AggregatedDocument] = []
+    seen: set[str] = set()
+
+    for raw_path in selected_paths:
+        key = raw_path.strip()
+        doc = by_path.get(key) or by_filename.get(Path(key).name)
+        if doc is None or doc.document.rel_path in seen:
+            continue
+        selected.append(doc)
+        seen.add(doc.document.rel_path)
+        if len(selected) >= final_top_k:
+            return selected
+
+    for doc in rank_aggregated_documents(aggregate):
+        if doc.document.rel_path in seen:
+            continue
+        selected.append(doc)
+        seen.add(doc.document.rel_path)
+        if len(selected) >= final_top_k:
+            break
+    return selected
+
+
+def aggregated_document_to_record(
+    doc: AggregatedDocument,
+    *,
+    rank: int,
+    include_text: bool,
+) -> dict[str, Any]:
+    candidate = doc.document
+    record: dict[str, Any] = {
+        "rank": rank,
+        "retrieval_rank": rank,
+        "retrieval_score": doc.best_score,
+        "agentic_best_search_rank": doc.best_rank,
+        "agentic_first_seen_iteration": doc.first_seen_iteration,
+        "agentic_hit_count": doc.hit_count,
+        "agentic_best_query": doc.best_query,
+        "agentic_seen_queries": doc.seen_queries,
+        "path": candidate.rel_path,
+        "filename": candidate.path.name,
+        "truncated": candidate.truncated,
+    }
+    record.update({key: value for key, value in candidate.metadata.items() if value is not None})
+    if include_text:
+        record["text"] = candidate.text
+    return record
+
+
+def search_step_record(
+    *,
+    iteration: int,
+    query: str,
+    hits: list[SearchHit],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    return {
+        "iteration": iteration,
+        "query": query,
+        "num_hits": len(hits),
+        "documents": [
+            hit_to_observation(hit, max_snippet_chars=args.agent_max_snippet_chars)
+            for hit in hits[: args.agent_observation_docs]
+        ],
+    }
+
+
+def run_agentic_retrieval_for_question(
+    *,
+    question_entry: dict[str, str],
+    documents: list[CandidateDocument],
+    embedding_model: Qwen3EmbeddingVllm,
+    planner: AgenticQueryPlanner,
+    system_prompt: str,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    question = question_entry["question"]
+    index = QuestionRetrievalIndex(
+        embedding_model,
+        documents,
+        dim=args.embedding_dim,
+        batch_size=args.embedding_batch_size,
+        normalize=args.normalize,
+    )
+    aggregate: dict[str, AggregatedDocument] = {}
+    search_steps: list[dict[str, Any]] = []
+    planner_steps: list[dict[str, Any]] = []
+    seen_queries: set[str] = set()
+    selected_paths: list[str] = []
+    stop_reason = "max_iterations"
+
+    if args.initial_search:
+        hits = index.search(question, top_k=args.search_top_k, iteration=0)
+        add_hits_to_aggregate(aggregate, hits)
+        search_steps.append(search_step_record(iteration=0, query=question, hits=hits, args=args))
+        seen_queries.add(normalized_query(question))
+
+    for iteration in range(1, args.max_iterations + 1):
+        prompt = build_planner_prompt(
+            system_prompt,
+            question=question,
+            search_steps=search_steps,
+            aggregate=aggregate,
+            iteration=iteration,
+            args=args,
+        )
+        raw_response = planner.propose(prompt)
+        action = parse_agent_action(raw_response)
+        planner_record: dict[str, Any] = {
+            "iteration": iteration,
+            "action": action.action,
+            "thought": action.thought,
+            "raw_response": action.raw_response,
+        }
+        if action.parse_error:
+            planner_record["parse_error"] = action.parse_error
+
+        if action.action == "final_results":
+            selected_paths = action.document_paths
+            planner_record["document_paths"] = selected_paths
+            planner_steps.append(planner_record)
+            stop_reason = "final_results"
+            break
+
+        query = (action.query or "").strip()
+        planner_record["query"] = query
+        normalized = normalized_query(query)
+        if not query:
+            planner_record["parse_error"] = "Planner requested search without a query"
+            planner_steps.append(planner_record)
+            stop_reason = "empty_query"
+            break
+        if normalized in seen_queries:
+            planner_record["duplicate_query"] = True
+            planner_steps.append(planner_record)
+            stop_reason = "duplicate_query"
+            break
+
+        hits = index.search(query, top_k=args.search_top_k, iteration=iteration)
+        add_hits_to_aggregate(aggregate, hits)
+        seen_queries.add(normalized)
+        search_steps.append(search_step_record(iteration=iteration, query=query, hits=hits, args=args))
+        planner_steps.append(planner_record)
+
+    final_documents = resolve_selected_documents(
+        aggregate,
+        selected_paths,
+        final_top_k=args.final_top_k,
+    )
+    queries = [step["query"] for step in search_steps]
+    return {
+        "question_id": question_entry["question_id"],
+        "question": question,
+        "num_candidate_docs": len(documents),
+        "top_k": args.final_top_k,
+        "retrieval_top_k": args.search_top_k,
+        "agentic": True,
+        "agent_provider": planner.config.name,
+        "agent_model": planner.model_name,
+        "agent_max_iterations": args.max_iterations,
+        "agent_num_iterations": len(planner_steps),
+        "agent_stop_reason": stop_reason,
+        "agent_queries": queries,
+        "agent_planner_steps": planner_steps,
+        "agent_search_steps": search_steps,
+        "gold_and_support_only": bool(args.gold_and_support_only),
+        "retrieval_model": args.embedding_model_name_or_path,
+        "embedding_dim": args.embedding_dim,
+        "normalized": bool(args.normalize),
+        "documents": [
+            aggregated_document_to_record(doc, rank=rank, include_text=not args.no_text)
+            for rank, doc in enumerate(final_documents, start=1)
+        ],
+    }
+
+
+def run_agentic_retrieval(args: argparse.Namespace) -> list[dict[str, Any]]:
+    questions = select_questions(load_heldout_questions(args.questions_path), args.query_id, args.limit)
+    logger.info("Loaded %d heldout questions", len(questions))
+
+    system_prompt = render_agent_template(
+        args.agent_prompt_path,
+        extended_relevance=args.agent_extended_relevance,
+        enforce_top_k=args.agent_enforce_top_k,
+        top_k=args.final_top_k,
+        with_init_docs=args.initial_search,
+    )
+    planner = AgenticQueryPlanner(
+        args.agent_provider,
+        args.agent_model_name,
+        max_completion_tokens=args.agent_max_completion_tokens,
+        reasoning_effort=resolve_reasoning_arg(args.agent_reasoning_effort),
+        use_cache=args.agent_use_cache,
+    )
+    embedding_model = Qwen3EmbeddingVllm(
+        args.embedding_model_name_or_path,
+        instruction=args.embedding_instruction,
+        tensor_parallel_size=args.embedding_tensor_parallel_size,
+        max_model_len=args.embedding_max_model_len,
+        gpu_memory_utilization=args.embedding_gpu_memory_utilization,
+    )
+
+    records: list[dict[str, Any]] = []
+    try:
+        for question_entry in tqdm(questions, desc="Agentic retrieval"):
+            question_id = question_entry["question_id"]
+            try:
+                documents = load_candidate_documents(
+                    args.docs_dir,
+                    args.privileged_dir,
+                    question_id,
+                    args.max_doc_chars,
+                    gold_and_support_only=bool(args.gold_and_support_only),
+                )
+                record = run_agentic_retrieval_for_question(
+                    question_entry=question_entry,
+                    documents=documents,
+                    embedding_model=embedding_model,
+                    planner=planner,
+                    system_prompt=system_prompt,
+                    args=args,
+                )
+            except Exception as exc:
+                logger.exception("Failed agentic retrieval for question %s", question_id)
+                record = {
+                    "question_id": question_id,
+                    "question": question_entry["question"],
+                    "agentic": True,
+                    "agent_provider": planner.config.name,
+                    "agent_model": planner.model_name,
+                    "gold_and_support_only": bool(args.gold_and_support_only),
+                    "error": str(exc),
+                    "documents": [],
+                }
+            records.append(record)
+    finally:
+        planner.stop()
+        embedding_model.stop()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    write_jsonl(records, args.retrieval_output_path)
+    logger.info("Wrote %d agentic retrieval records to %s", len(records), args.retrieval_output_path)
+    return records
+
+
+def build_answer_args(args: argparse.Namespace) -> argparse.Namespace:
+    return argparse.Namespace(
+        non_local_answerer=args.non_local_answerer,
+        provider=args.provider,
+        model_name_or_path=args.model_name_or_path,
+        max_concurrent=args.max_concurrent,
+        answer_reasoning_effort=args.answer_reasoning_effort,
+        answer_use_cache=args.answer_use_cache,
+        input_path=args.retrieval_output_path,
+        output_path=args.output_path,
+        docs_dir=args.docs_dir,
+        tensor_parallel_size=args.tensor_parallel_size,
+        distributed_executor_backend=args.distributed_executor_backend,
+        max_model_len=args.max_model_len,
+        max_prompt_tokens=args.max_prompt_tokens,
+        max_new_tokens=args.max_new_tokens,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        dtype=args.dtype,
+        trust_remote_code=args.trust_remote_code,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        batch_size=args.batch_size,
+        top_docs=args.top_docs,
+        max_doc_chars=args.answer_max_doc_chars,
+        min_doc_chars=args.min_doc_chars,
+        n=args.n,
+        privileged_dir=args.privileged_dir,
+        judge=args.judge,
+        judge_provider=args.judge_provider,
+        judge_model_name=args.judge_model_name,
+        judge_max_concurrent=args.judge_max_concurrent,
+        judge_max_completion_tokens=args.judge_max_completion_tokens,
+        judge_reasoning_effort=args.judge_reasoning_effort,
+        judge_use_cache=args.judge_use_cache,
+        disable_thinking=args.disable_thinking,
+        limit=None,
+        query_id=None,
+        resume=args.resume,
+        log_level=args.log_level,
+    )
+
+
+def run_agentic_rag(args: argparse.Namespace) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    retrieval_records = run_agentic_retrieval(args)
+    answer_output_records: list[dict[str, Any]] = []
+    if not args.skip_answer:
+        answer_output_records = answer_records(build_answer_args(args))
+    return retrieval_records, answer_output_records
+
+
+def main() -> None:
+    load_env_file(REPO_ROOT / ".env")
+    args = parse_args()
+    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO))
+    run_agentic_rag(args)
+
+
+if __name__ == "__main__":
+    main()

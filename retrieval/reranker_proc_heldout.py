@@ -23,6 +23,8 @@ try:
     from retrieval.retrieve_proc_heldout import (
         DEFAULT_DOCS_DIR,
         DEFAULT_QUESTIONS_PATH,
+        DEFAULT_PRIVILEGED_DIR,
+        DEFAULT_GOLD_AND_SUPPORT_ONLY,
         CandidateDocument,
         Qwen3EmbeddingVllm,
         RetrievedDocument,
@@ -39,6 +41,8 @@ except ModuleNotFoundError as exc:
     from retrieve_proc_heldout import (
         DEFAULT_DOCS_DIR,
         DEFAULT_QUESTIONS_PATH,
+        DEFAULT_PRIVILEGED_DIR,
+        DEFAULT_GOLD_AND_SUPPORT_ONLY,
         CandidateDocument,
         Qwen3EmbeddingVllm,
         RetrievedDocument,
@@ -54,7 +58,57 @@ except ModuleNotFoundError as exc:
 logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_retrieval_reranked.jsonl"
+DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_retrieval_reranked_supponly.jsonl"
+
+
+def normalize_token_ids(tokenized: Any) -> list[int]:
+    if hasattr(tokenized, "tolist"):
+        tokenized = tokenized.tolist()
+    return [int(token_id) for token_id in tokenized]
+
+
+def normalize_batched_token_ids(tokenized: Any) -> list[list[int]]:
+    if hasattr(tokenized, "get") and "input_ids" in tokenized:
+        tokenized = tokenized["input_ids"]
+    if hasattr(tokenized, "tolist"):
+        tokenized = tokenized.tolist()
+    if not tokenized:
+        return []
+    if isinstance(tokenized[0], int):
+        return [normalize_token_ids(tokenized)]
+    return [normalize_token_ids(tokens) for tokens in tokenized]
+
+
+def token_logprob(logprobs: Any, token_id: int, default: float = -10.0) -> float:
+    token_logprob_value = logprobs.get(token_id) if hasattr(logprobs, "get") else None
+    if token_logprob_value is None:
+        return default
+    if hasattr(token_logprob_value, "logprob"):
+        return float(token_logprob_value.logprob)
+    return float(token_logprob_value)
+
+
+def apply_chat_template_compat(tokenizer: Any, messages: list[list[dict[str, str]]]) -> list[list[int]]:
+    base_kwargs: dict[str, Any] = {
+        "tokenize": True,
+        "add_generation_prompt": False,
+    }
+    for extra_kwargs in (
+        {"enable_thinking": False, "return_dict": False},
+        {"return_dict": False},
+        {"enable_thinking": False},
+        {},
+    ):
+        try:
+            tokenized_messages = tokenizer.apply_chat_template(
+                messages,
+                **base_kwargs,
+                **extra_kwargs,
+            )
+            return normalize_batched_token_ids(tokenized_messages)
+        except TypeError:
+            continue
+    raise RuntimeError("Unable to apply tokenizer chat template with supported arguments")
 
 
 @dataclass(frozen=True)
@@ -129,12 +183,7 @@ class Qwen3RerankerVllm:
 
     def compute_scores(self, pairs: list[tuple[str, str]]) -> list[float]:
         messages = [self.format_instruction(self.instruction, query, doc) for query, doc in pairs]
-        tokenized_messages = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=False,
-            enable_thinking=False,
-        )
+        tokenized_messages = apply_chat_template_compat(self.tokenizer, messages)
         tokenized_messages = [tokens[: self.max_length] + self.suffix_tokens for tokens in tokenized_messages]
         prompts = [TokensPrompt(prompt_token_ids=tokens) for tokens in tokenized_messages]
 
@@ -142,8 +191,8 @@ class Qwen3RerankerVllm:
         scores: list[float] = []
         for output in outputs:
             final_logits = output.outputs[0].logprobs[-1]
-            true_logit = final_logits[self.true_token].logprob if self.true_token in final_logits else -10
-            false_logit = final_logits[self.false_token].logprob if self.false_token in final_logits else -10
+            true_logit = token_logprob(final_logits, self.true_token)
+            false_logit = token_logprob(final_logits, self.false_token)
             true_score = math.exp(true_logit)
             false_score = math.exp(false_logit)
             scores.append(true_score / (true_score + false_score))
@@ -161,15 +210,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--privileged-dir",
         type=Path,
-        default=None,
-        help="Optional manifest source for docid/url/label metadata, e.g. data/train_privileged. Scores never use this.",
+        default=DEFAULT_PRIVILEGED_DIR,
+        help=(
+            "Optional manifest source for docid/url/label metadata, e.g. data/train_privileged. "
+            "Required by --gold-and-support-only."
+        ),
     )
     parser.add_argument("--output-path", type=Path, default=DEFAULT_OUTPUT_PATH)
 
     parser.add_argument("--embedding-model-name-or-path", default="Qwen/Qwen3-Embedding-4B")
     parser.add_argument("--embedding-instruction", default=None)
     parser.add_argument("--embedding-dim", type=int, default=1024)
-    parser.add_argument("--embedding-batch-size", type=int, default=16)
+    parser.add_argument("--embedding-batch-size", type=int, default=128)
     parser.add_argument("--embedding-tensor-parallel-size", type=int, default=None)
     parser.add_argument("--embedding-max-model-len", type=int, default=None)
     parser.add_argument("--embedding-gpu-memory-utilization", type=float, default=None)
@@ -179,14 +231,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reranker-instruction", default="Retrieve documents that can answer the user's query")
     parser.add_argument("--reranker-max-length", type=int, default=2048)
     parser.add_argument("--reranker-max-model-len", type=int, default=10000)
-    parser.add_argument("--reranker-batch-size", type=int, default=16)
+    parser.add_argument("--reranker-batch-size", type=int, default=128)
     parser.add_argument("--reranker-tensor-parallel-size", type=int, default=None)
     parser.add_argument("--reranker-gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--reranker-distributed-executor-backend", default=None)
 
-    parser.add_argument("--retrieval-top-k", type=int, default=50)
-    parser.add_argument("--rerank-top-k", type=int, default=20)
+    parser.add_argument("--retrieval-top-k", type=int, default=10)
+    parser.add_argument("--rerank-top-k", type=int, default=5)
     parser.add_argument("--max-doc-chars", type=int, default=30_000)
+    parser.add_argument(
+        "--gold-and-support-only",
+        type=bool,
+        help=(
+            "Only retrieve and rerank manifest docs labeled as gold or supporting/evidence docs. "
+            "Requires --privileged-dir."
+        ),
+        default=DEFAULT_GOLD_AND_SUPPORT_ONLY
+    )
     parser.add_argument("--no-text", action="store_true", help="Omit document text from the output JSONL.")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument(
@@ -208,6 +269,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--reranker-batch-size must be at least 1")
     if args.max_doc_chars < 0:
         parser.error("--max-doc-chars must be >= 0")
+    if args.gold_and_support_only and args.privileged_dir is None:
+        parser.error("--gold-and-support-only requires --privileged-dir")
     return args
 
 
@@ -233,6 +296,7 @@ def collect_retrieval_candidates(args: argparse.Namespace) -> list[RetrievalResu
                     args.privileged_dir,
                     question_id,
                     args.max_doc_chars,
+                    gold_and_support_only=bool(getattr(args, "gold_and_support_only", False)),
                 )
                 retrieved_documents = retrieve_documents(
                     model,
@@ -330,6 +394,7 @@ def build_rerank_record(
         "num_candidate_docs": len(retrieval_result.documents),
         "retrieval_top_k": args.retrieval_top_k,
         "rerank_top_k": args.rerank_top_k,
+        "gold_and_support_only": bool(getattr(args, "gold_and_support_only", False)),
         "retrieval_model": args.embedding_model_name_or_path,
         "reranker_model": args.reranker_model_name_or_path,
         "embedding_dim": args.embedding_dim,

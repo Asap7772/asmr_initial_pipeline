@@ -54,8 +54,14 @@ except ModuleNotFoundError as exc:
 logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_INPUT_PATH = REPO_ROOT / "retrieval" / "heldout_retrieval.jsonl"
-DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_answers_gemini.jsonl"
+# DEFAULT_INPUT_PATH = REPO_ROOT / "retrieval" / "heldout_retrieval_supponly.jsonl"
+# DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_answers_supponly_gemini.jsonl"
+# DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_answers_supponly_qwen.jsonl"
+
+DEFAULT_INPUT_PATH = REPO_ROOT / "retrieval" / "heldout_retrieval_reranked_supponly.jsonl"
+# DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_answers_reranked_supponly_qwen.jsonl"
+DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_answers_reranked_supponly_gemini.jsonl"
+DEFAULT_NON_LOCAL_ANSWERER=True
 DEFAULT_LOCAL_MODEL = "Qwen/Qwen3.5-4B"
 
 SYSTEM_PROMPT = """You answer questions using only the retrieved documents provided.
@@ -359,9 +365,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--non-local-answerer",
-        "--non_local_answerer",
         action="store_true",
-        default=False,
+        default=DEFAULT_NON_LOCAL_ANSWERER,
         dest="non_local_answerer",
         help="Use inference.collect_llm instead of local vLLM/Qwen.",
     )

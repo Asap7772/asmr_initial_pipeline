@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import logging
 from dataclasses import dataclass
@@ -21,8 +22,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_QUESTIONS_PATH = REPO_ROOT / "data" / "heldout_50_questions.json"
 DEFAULT_DOCS_DIR = REPO_ROOT / "data" / "train"
 DEFAULT_PRIVILEGED_DIR = REPO_ROOT / "data" / "train_privileged"
-DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_retrieval.jsonl"
-
+DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_retrieval_supponly.jsonl"
+GOLD_AND_SUPPORT_LABELS = frozenset({"gold_docs", "evidence_docs", "support_docs", "supporting_docs"})
+DEFAULT_GOLD_AND_SUPPORT_ONLY=True
 
 @dataclass(frozen=True)
 class CandidateDocument:
@@ -41,6 +43,35 @@ class RetrievedDocument:
     retrieval_rank: int
 
 
+def build_embedding_llm_kwargs(
+    model_name_or_path: str,
+    *,
+    tensor_parallel_size: int | None,
+    max_model_len: int | None,
+    gpu_memory_utilization: float | None,
+) -> dict[str, Any]:
+    llm_signature = inspect.signature(LLM)
+    llm_kwargs: dict[str, Any] = {
+        "model": model_name_or_path,
+        "hf_overrides": {"is_matryoshka": True},
+    }
+    if {"runner", "convert"}.issubset(llm_signature.parameters):
+        llm_kwargs["runner"] = "pooling"
+        llm_kwargs["convert"] = "embed"
+    else:
+        llm_kwargs["task"] = "embed"
+
+    if tensor_parallel_size is not None:
+        llm_kwargs["tensor_parallel_size"] = tensor_parallel_size
+    else:
+        llm_kwargs["tensor_parallel_size"] = max(torch.cuda.device_count(), 1)
+    if max_model_len is not None:
+        llm_kwargs["max_model_len"] = max_model_len
+    if gpu_memory_utilization is not None:
+        llm_kwargs["gpu_memory_utilization"] = gpu_memory_utilization
+    return llm_kwargs
+
+
 class Qwen3EmbeddingVllm:
     def __init__(
         self,
@@ -54,19 +85,14 @@ class Qwen3EmbeddingVllm:
             instruction = "Given a web search query, retrieve relevant passages that answer the query"
         self.instruction = instruction
 
-        llm_kwargs: dict[str, Any] = {
-            "model": model_name_or_path,
-            "task": "embed",
-            "hf_overrides": {"is_matryoshka": True},
-        }
-        if tensor_parallel_size is not None:
-            llm_kwargs["tensor_parallel_size"] = tensor_parallel_size
-        if max_model_len is not None:
-            llm_kwargs["max_model_len"] = max_model_len
-        if gpu_memory_utilization is not None:
-            llm_kwargs["gpu_memory_utilization"] = gpu_memory_utilization
-
-        self.model = LLM(**llm_kwargs)
+        self.model = LLM(
+            **build_embedding_llm_kwargs(
+                model_name_or_path,
+                tensor_parallel_size=tensor_parallel_size,
+                max_model_len=max_model_len,
+                gpu_memory_utilization=gpu_memory_utilization,
+            )
+        )
 
     def get_detailed_instruct(self, task_description: str | None, query: str) -> str:
         if task_description is None:
@@ -102,16 +128,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--privileged-dir",
         type=Path,
-        default=None,
-        help="Optional manifest source for docid/url/label metadata, e.g. data/train_privileged. Scores never use this.",
+        default=DEFAULT_PRIVILEGED_DIR,
+        help=(
+            "Optional manifest source for docid/url/label metadata, e.g. data/train_privileged. "
+            "Required by --gold-and-support-only."
+        ),
     )
     parser.add_argument("--output-path", type=Path, default=DEFAULT_OUTPUT_PATH)
     parser.add_argument("--model-name-or-path", default="Qwen/Qwen3-Embedding-4B")
     parser.add_argument("--instruction", default=None)
-    parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--dim", type=int, default=1024)
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--max-doc-chars", type=int, default=30_000)
+    parser.add_argument(
+        "--gold-and-support-only",
+        type=bool,
+        help=(
+            "Only retrieve from manifest docs labeled as gold or supporting/evidence docs. "
+            "Requires --privileged-dir."
+        ),
+        default=DEFAULT_GOLD_AND_SUPPORT_ONLY,
+    )
     parser.add_argument("--tensor-parallel-size", type=int, default=None)
     parser.add_argument("--max-model-len", type=int, default=None)
     parser.add_argument("--gpu-memory-utilization", type=float, default=None)
@@ -133,6 +171,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--batch-size must be at least 1")
     if args.max_doc_chars < 0:
         parser.error("--max-doc-chars must be >= 0")
+    if args.gold_and_support_only and args.privileged_dir is None:
+        parser.error("--gold-and-support-only requires --privileged-dir")
     return args
 
 
@@ -204,12 +244,22 @@ def load_candidate_documents(
     privileged_dir: Path | None,
     question_id: str,
     max_doc_chars: int,
+    gold_and_support_only: bool = False,
 ) -> list[CandidateDocument]:
     question_docs_dir = docs_dir / question_id
     if not question_docs_dir.exists():
         raise FileNotFoundError(f"No document directory found for question {question_id}: {question_docs_dir}")
     if not question_docs_dir.is_dir():
         raise NotADirectoryError(f"Document path is not a directory: {question_docs_dir}")
+    if gold_and_support_only and privileged_dir is None:
+        raise ValueError("gold_and_support_only requires a privileged_dir with manifest.json files")
+    if gold_and_support_only:
+        assert privileged_dir is not None
+        manifest_path = privileged_dir / question_id / "manifest.json"
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"No manifest found for gold_and_support_only question {question_id}: {manifest_path}"
+            )
 
     manifest_metadata = load_manifest_by_filename(privileged_dir, question_id)
     documents: list[CandidateDocument] = []
@@ -220,6 +270,10 @@ def load_candidate_documents(
         if path.name in {"query.txt", "answer.txt"}:
             continue
 
+        metadata = manifest_metadata.get(path.name, {})
+        if gold_and_support_only and metadata.get("label") not in GOLD_AND_SUPPORT_LABELS:
+            continue
+
         text, truncated = read_document_text(path, max_doc_chars)
         documents.append(
             CandidateDocument(
@@ -228,7 +282,7 @@ def load_candidate_documents(
                 rel_path=path.relative_to(docs_dir).as_posix(),
                 text=text,
                 truncated=truncated,
-                metadata=manifest_metadata.get(path.name, {}),
+                metadata=metadata,
             )
         )
 
@@ -313,6 +367,7 @@ def build_retrieval_record(
         "question": question_entry["question"],
         "num_candidate_docs": len(documents),
         "top_k": args.top_k,
+        "gold_and_support_only": bool(getattr(args, "gold_and_support_only", False)),
         "retrieval_model": args.model_name_or_path,
         "embedding_dim": args.dim,
         "normalized": bool(args.normalize),
@@ -352,6 +407,7 @@ def run_retrieval(args: argparse.Namespace) -> list[dict[str, Any]]:
                     args.privileged_dir,
                     question_id,
                     args.max_doc_chars,
+                    gold_and_support_only=bool(getattr(args, "gold_and_support_only", False)),
                 )
                 retrieved_documents = retrieve_documents(
                     model,
@@ -368,6 +424,7 @@ def run_retrieval(args: argparse.Namespace) -> list[dict[str, Any]]:
                 record = {
                     "question_id": question_id,
                     "question": question_entry["question"],
+                    "gold_and_support_only": bool(getattr(args, "gold_and_support_only", False)),
                     "error": str(exc),
                     "documents": [],
                 }
