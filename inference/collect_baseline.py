@@ -83,6 +83,7 @@ class InferenceResult:
     response: str
     gold_answer: str | None
     tool_reads: list[ToolRead]
+    sample_idx: int = 0
     error: str | None = None
 
 
@@ -93,9 +94,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--agent-data-dir", type=Path, default=DEFAULT_AGENT_DATA_DIR)
     parser.add_argument("--privileged-data-dir", type=Path, default=DEFAULT_PRIVILEGED_DATA_DIR)
     parser.add_argument("--output-path", type=Path, default=DEFAULT_OUTPUT_PATH)
+    parser.add_argument("--N", type=int, default=4)  # number of independent traces to generate for each query
+    parser.add_argument("--temperature", type=float, default=1.0)  # temperature to use for sampling (only relevant if provider supports temperature)
+    parser.add_argument("--top_p", type=float, default=0.95)  # top p to use for sampling (only relevant if provider supports top p)
+    parser.add_argument("--top_k", type=int, default=20)  # top k to use for sampling (only relevant if provider supports top k)
     parser.add_argument("--provider", default="openrouter")
-    parser.add_argument("--model-name", default="qwen/qwen3.5-35b-a3b")
+    parser.add_argument("--model-name", default="qwen/qwen3.5-35b-a3b") 
     parser.add_argument("--max-concurrent", type=int, default=4)
+    parser.add_argument("--max-problems", type=int, default=50)  # if greater than 0, only run this many problems
     parser.add_argument("--max-steps", type=int, default=8)
     parser.add_argument("--max-file-chars", type=int, default=120_000)
     parser.add_argument("--max-completion-tokens", type=int, default=32_768)
@@ -110,9 +116,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Skip query ids already present in the output JSONL.",
+        help="Skip query id/sample pairs already present in the output JSONL.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.N < 1:
+        parser.error("--N must be at least 1")
+    if args.max_concurrent < 1:
+        parser.error("--max-concurrent must be at least 1")
+    return args
 
 
 def read_text_if_exists(path: Path) -> str | None:
@@ -133,18 +144,21 @@ def discover_query_ids(agent_data_dir: Path, selected: list[str] | None, limit: 
     return query_ids[:limit] if limit is not None else query_ids
 
 
-def load_completed_query_ids(output_path: Path) -> set[str]:
+def load_completed_samples(output_path: Path) -> dict[str, set[int]]:
     if not output_path.exists():
-        return set()
+        return {}
 
-    completed: set[str] = set()
+    completed: dict[str, set[int]] = {}
     with output_path.open("r", encoding="utf-8") as f:
         for line in f:
             if not line.strip():
                 continue
             try:
-                completed.add(str(json.loads(line)["query_id"]))
-            except (json.JSONDecodeError, KeyError):
+                record = json.loads(line)
+                query_id = str(record["query_id"])
+                sample_idx = int(record.get("sample_idx", 0))
+                completed.setdefault(query_id, set()).add(sample_idx)
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                 continue
     return completed
 
@@ -244,6 +258,9 @@ def build_request_kwargs(
     model_name: str,
     max_completion_tokens: int,
     reasoning_effort: ReasoningEffort,
+    temperature: float,
+    top_p: float,
+    top_k: int,
     include_tools: bool,
 ) -> dict[str, Any]:
     config = get_provider_config(provider)
@@ -254,6 +271,13 @@ def build_request_kwargs(
         config.max_tokens_param: max_completion_tokens,
     }
 
+    if temperature >= 0:
+        kwargs["temperature"] = temperature
+    if top_p > 0:
+        kwargs["top_p"] = top_p
+    if top_k > 0 and config.name != "openai":
+        kwargs.setdefault("extra_body", {})["top_k"] = top_k
+
     if include_tools:
         kwargs["tools"] = TOOLS
         kwargs["tool_choice"] = "auto"
@@ -262,7 +286,7 @@ def build_request_kwargs(
         if config.reasoning_mode == "request_param":
             kwargs["reasoning_effort"] = resolved_reasoning_effort
         elif config.reasoning_mode == "openrouter_extra_body":
-            kwargs["extra_body"] = {"reasoning": {"effort": resolved_reasoning_effort}}
+            kwargs.setdefault("extra_body", {})["reasoning"] = {"effort": resolved_reasoning_effort}
 
     return kwargs
 
@@ -275,6 +299,9 @@ async def create_completion_with_retries(
     model_name: str,
     max_completion_tokens: int,
     reasoning_effort: ReasoningEffort,
+    temperature: float,
+    top_p: float,
+    top_k: int,
     include_tools: bool,
     max_retries: int = 10,
 ) -> Any:
@@ -287,6 +314,9 @@ async def create_completion_with_retries(
                     model_name=model_name,
                     max_completion_tokens=max_completion_tokens,
                     reasoning_effort=reasoning_effort,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
                     include_tools=include_tools,
                 )
             )
@@ -306,6 +336,7 @@ async def run_query(
     client: AsyncOpenAI,
     *,
     query_id: str,
+    sample_idx: int,
     agent_data_dir: Path,
     privileged_data_dir: Path,
     provider: ProviderLike,
@@ -314,6 +345,9 @@ async def run_query(
     max_file_chars: int,
     max_completion_tokens: int,
     reasoning_effort: ReasoningEffort,
+    temperature: float,
+    top_p: float,
+    top_k: int,
     semaphore: asyncio.Semaphore,
 ) -> InferenceResult:
     query_dir = agent_data_dir / query_id
@@ -322,9 +356,25 @@ async def run_query(
     gold_answer = read_text_if_exists(privileged_query_dir / "answer.txt")
 
     if query is None:
-        return InferenceResult(query_id=query_id, query="", response="", gold_answer=gold_answer, tool_reads=[], error="Missing query.txt")
+        return InferenceResult(
+            query_id=query_id,
+            query="",
+            response="",
+            gold_answer=gold_answer,
+            tool_reads=[],
+            sample_idx=sample_idx,
+            error="Missing query.txt",
+        )
     if not query_dir.exists():
-        return InferenceResult(query_id=query_id, query=query, response="", gold_answer=gold_answer, tool_reads=[], error="Missing agent data directory")
+        return InferenceResult(
+            query_id=query_id,
+            query=query,
+            response="",
+            gold_answer=gold_answer,
+            tool_reads=[],
+            sample_idx=sample_idx,
+            error="Missing agent data directory",
+        )
 
     filesystem_hierarchy = build_filesystem_hierarchy(query_dir, query_id)
     messages: list[dict[str, Any]] = [
@@ -349,6 +399,9 @@ async def run_query(
                     model_name=model_name,
                     max_completion_tokens=max_completion_tokens,
                     reasoning_effort=reasoning_effort,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
                     include_tools=True,
                 )
                 message = completion.choices[0].message
@@ -362,6 +415,7 @@ async def run_query(
                         response=(message.content or "").strip(),
                         gold_answer=gold_answer.strip() if gold_answer is not None else None,
                         tool_reads=tool_reads,
+                        sample_idx=sample_idx,
                     )
 
                 for tool_call in tool_calls:
@@ -390,6 +444,9 @@ async def run_query(
                 model_name=model_name,
                 max_completion_tokens=max_completion_tokens,
                 reasoning_effort=reasoning_effort,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
                 include_tools=False,
             )
             response = completion.choices[0].message.content or ""
@@ -399,6 +456,7 @@ async def run_query(
                 response=response.strip(),
                 gold_answer=gold_answer.strip() if gold_answer is not None else None,
                 tool_reads=tool_reads,
+                sample_idx=sample_idx,
                 error="max_steps_reached",
             )
         except Exception as exc:
@@ -408,15 +466,25 @@ async def run_query(
                 response="",
                 gold_answer=gold_answer.strip() if gold_answer is not None else None,
                 tool_reads=tool_reads,
+                sample_idx=sample_idx,
                 error=str(exc),
             )
 
 
 async def run_all(args: argparse.Namespace) -> list[InferenceResult]:
-    query_ids = discover_query_ids(args.agent_data_dir, args.query_id, args.limit)
+    limit = args.limit
+    if args.max_problems > 0:
+        limit = args.max_problems if limit is None else min(limit, args.max_problems)
+
+    query_ids = discover_query_ids(args.agent_data_dir, args.query_id, limit)
+    sample_jobs = [(query_id, sample_idx) for query_id in query_ids for sample_idx in range(args.N)]
     if args.resume:
-        completed = load_completed_query_ids(args.output_path)
-        query_ids = [query_id for query_id in query_ids if query_id not in completed]
+        completed = load_completed_samples(args.output_path)
+        sample_jobs = [
+            (query_id, sample_idx)
+            for query_id, sample_idx in sample_jobs
+            if sample_idx not in completed.get(query_id, set())
+        ]
 
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
     client = create_async_client(args.provider)
@@ -429,6 +497,7 @@ async def run_all(args: argparse.Namespace) -> list[InferenceResult]:
         run_query(
             client,
             query_id=query_id,
+            sample_idx=sample_idx,
             agent_data_dir=args.agent_data_dir,
             privileged_data_dir=args.privileged_data_dir,
             provider=args.provider,
@@ -437,11 +506,14 @@ async def run_all(args: argparse.Namespace) -> list[InferenceResult]:
             max_file_chars=args.max_file_chars,
             max_completion_tokens=args.max_completion_tokens,
             reasoning_effort=reasoning_effort,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
             semaphore=semaphore,
         )
-        for query_id in query_ids
+        for query_id, sample_idx in sample_jobs
     ]
-    results = await tqdm_asyncio.gather(*tasks, desc="Running file-reading inference")
+    results = await tqdm_asyncio.gather(*tasks, desc="Running file-reading inference") if tasks else []
 
     mode = "a" if args.resume else "w"
     with args.output_path.open(mode, encoding="utf-8") as f:
