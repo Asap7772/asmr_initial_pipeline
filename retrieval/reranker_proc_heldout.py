@@ -13,7 +13,11 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.distributed.parallel_state import destroy_distributed_environment, destroy_model_parallel
-from vllm.inputs.data import TokensPrompt
+
+try:
+    from vllm.inputs import TokensPrompt
+except ImportError:
+    from vllm.inputs.data import TokensPrompt
 
 try:
     from retrieval.retrieve_proc_heldout import (
