@@ -67,6 +67,9 @@ else
 fi
 
 MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3.5-4B}"
+MODEL_CONTEXT_WINDOW_TOKENS="${MODEL_CONTEXT_WINDOW_TOKENS:-65536}"
+CONTEXT_WINDOW_SAFETY_TOKENS="${CONTEXT_WINDOW_SAFETY_TOKENS:-256}"
+MAX_TRAJECTORY_TOKENS="${MAX_TRAJECTORY_TOKENS:-140000}"
 RUN_ROOT="${RUN_ROOT:-$REPO_ROOT/tinker_runs}"
 SHELL_LOG_DIR="${SHELL_LOG_DIR:-$RUN_ROOT/shell_logs}"
 
@@ -79,7 +82,16 @@ done
 unset RAND_CHARS RAND_INDEX
 
 SWEEP_ID="${SWEEP_ID:-$RAND}"
-RUN_NAME_PREFIX="${RUN_NAME_PREFIX:-synth_fs_answerability}"
+RUN_NAME_PREFIX="${RUN_NAME_PREFIX:-synth_fs_answerability_fixes}"
+SWEEP_INDEX="${SWEEP_INDEX:-}"
+if [ "$#" -gt 0 ] && [[ "$1" =~ ^[0-9]+$ ]]; then
+  SWEEP_INDEX="$1"
+  shift
+fi
+if [ -n "$SWEEP_INDEX" ] && ! [[ "$SWEEP_INDEX" =~ ^[0-9]+$ ]]; then
+  echo "SWEEP_INDEX must be a non-negative integer, got: $SWEEP_INDEX" >&2
+  exit 2
+fi
 EXTRA_ARGS=("$@")
 
 mkdir -p "$RUN_ROOT" "$SHELL_LOG_DIR"
@@ -146,6 +158,9 @@ run_one_dataset() {
   echo "TRAIN_INDEX_JSONL=$train_index_jsonl"
   echo "EVAL_INDEX_JSONL=$eval_index_jsonl"
   echo "MODEL_NAME=$MODEL_NAME"
+  echo "MODEL_CONTEXT_WINDOW_TOKENS=$MODEL_CONTEXT_WINDOW_TOKENS"
+  echo "CONTEXT_WINDOW_SAFETY_TOKENS=$CONTEXT_WINDOW_SAFETY_TOKENS"
+  echo "MAX_TRAJECTORY_TOKENS=$MAX_TRAJECTORY_TOKENS"
   echo "DATA_ROOT=$DATA_ROOT"
   echo "AGENT_DIR=$AGENT_DIR"
   echo "PRIVILEGED_DIR=$PRIVILEGED_DIR"
@@ -178,8 +193,9 @@ run_one_dataset() {
     batch_size=16 \
     group_size=4 \
     max_turns=32 \
-    max_trajectory_tokens=140000 \
-    model_context_window_tokens=144352 \
+    max_trajectory_tokens="$MAX_TRAJECTORY_TOKENS" \
+    model_context_window_tokens="$MODEL_CONTEXT_WINDOW_TOKENS" \
+    context_window_safety_tokens="$CONTEXT_WINDOW_SAFETY_TOKENS" \
     step_penalty=0.0 \
     raw_docs_penalty=0.0 \
     builder_compaction_trigger_tokens=3000 \
@@ -261,6 +277,7 @@ run_one_dataset() {
 
 echo "SWEEP_ID=$SWEEP_ID"
 echo "RUN_NAME_PREFIX=$RUN_NAME_PREFIX"
+echo "SWEEP_INDEX=${SWEEP_INDEX:-all}"
 echo "SWEEP_DATASETS=${SWEEP_DATASET_PATHS[*]}"
 echo "MODEL_NAME=$MODEL_NAME"
 echo "DATA_ROOT=$DATA_ROOT"
@@ -278,7 +295,17 @@ echo "Extra train args: ${EXTRA_ARGS[*]}"
 
 pids=()
 run_names=()
-for dataset_path in "${SWEEP_DATASET_PATHS[@]}"; do
+if [ -n "$SWEEP_INDEX" ]; then
+  if [ "$SWEEP_INDEX" -ge "${#SWEEP_DATASET_PATHS[@]}" ]; then
+    echo "Sweep index $SWEEP_INDEX is out of range for ${#SWEEP_DATASET_PATHS[@]} datasets." >&2
+    exit 4
+  fi
+  selected_dataset_paths=("${SWEEP_DATASET_PATHS[$SWEEP_INDEX]}")
+else
+  selected_dataset_paths=("${SWEEP_DATASET_PATHS[@]}")
+fi
+
+for dataset_path in "${selected_dataset_paths[@]}"; do
   if [ -n "${INDEX_JSONL:-}" ]; then
     train_index_jsonl="$INDEX_JSONL"
   else

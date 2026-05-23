@@ -23,6 +23,65 @@ from tinker_cookbook.utils.misc_utils import safezip
 logger = logging.getLogger(__name__)
 
 
+def _known_model_context_window_tokens(model_name: str) -> int | None:
+    normalized = model_name.strip().lower()
+    if normalized == "qwen/qwen3.5-4b":
+        return 65536
+    return None
+
+
+def _effective_model_context_window_tokens(
+    *,
+    model_name: str,
+    configured_context_window_tokens: int | None,
+) -> int | None:
+    known_context_window_tokens = _known_model_context_window_tokens(model_name)
+    if known_context_window_tokens is None:
+        return configured_context_window_tokens
+    if configured_context_window_tokens is None:
+        logger.info(
+            "Using known context window for %s: %d tokens",
+            model_name,
+            known_context_window_tokens,
+        )
+        return known_context_window_tokens
+    if configured_context_window_tokens > known_context_window_tokens:
+        logger.warning(
+            "Configured model_context_window_tokens=%d exceeds the known served context "
+            "window for %s (%d); using %d instead.",
+            configured_context_window_tokens,
+            model_name,
+            known_context_window_tokens,
+            known_context_window_tokens,
+        )
+        return known_context_window_tokens
+    return configured_context_window_tokens
+
+
+def _install_sampler_context_window_patch(context_window_tokens: int | None) -> None:
+    if context_window_tokens is None or context_window_tokens <= 0:
+        return
+
+    from tinker_cookbook.rl import rollouts
+
+    original_completer = getattr(
+        rollouts,
+        "_synthetic_fs_original_tinker_token_completer",
+        None,
+    )
+    if original_completer is None:
+        original_completer = rollouts.TinkerTokenCompleter
+        rollouts._synthetic_fs_original_tinker_token_completer = original_completer
+
+    def context_window_tinker_token_completer(*args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("context_window", context_window_tokens)
+        return original_completer(*args, **kwargs)
+
+    rollouts.TinkerTokenCompleter = context_window_tinker_token_completer
+    rollouts._synthetic_fs_sampler_context_window_tokens = context_window_tokens
+    logger.info("Installed Tinker sampler context-window cap: %d tokens", context_window_tokens)
+
+
 def _install_rl_diagnostics_patch(
     *,
     ppo_clip_low_threshold: float,
@@ -990,16 +1049,21 @@ async def cli_main(cli_config: CLIConfig) -> None:
     renderer_name = cli_config.renderer_name or model_info.get_recommended_renderer_name(
         cli_config.model_name
     )
+    effective_model_context_window_tokens = _effective_model_context_window_tokens(
+        model_name=cli_config.model_name,
+        configured_context_window_tokens=cli_config.model_context_window_tokens,
+    )
+    _install_sampler_context_window_patch(effective_model_context_window_tokens)
     effective_max_trajectory_tokens = cli_config.max_trajectory_tokens
-    if cli_config.model_context_window_tokens is not None:
+    if effective_model_context_window_tokens is not None:
         safety_tokens = max(0, cli_config.context_window_safety_tokens)
         context_safe_max_trajectory_tokens = (
-            cli_config.model_context_window_tokens - cli_config.max_tokens - safety_tokens
+            effective_model_context_window_tokens - cli_config.max_tokens - safety_tokens
         )
         if context_safe_max_trajectory_tokens <= 0:
             raise ValueError(
                 "model_context_window_tokens must be larger than max_tokens plus "
-                f"context_window_safety_tokens; got {cli_config.model_context_window_tokens} "
+                f"context_window_safety_tokens; got {effective_model_context_window_tokens} "
                 f"<= {cli_config.max_tokens} + {safety_tokens}."
             )
         if effective_max_trajectory_tokens is None:
@@ -1008,6 +1072,16 @@ async def cli_main(cli_config: CLIConfig) -> None:
             effective_max_trajectory_tokens = min(
                 effective_max_trajectory_tokens,
                 context_safe_max_trajectory_tokens,
+            )
+        if effective_max_trajectory_tokens != cli_config.max_trajectory_tokens:
+            logger.info(
+                "Using max_trajectory_tokens=%d after context-window cap "
+                "(configured=%s, context_window=%d, max_tokens=%d, safety=%d).",
+                effective_max_trajectory_tokens,
+                cli_config.max_trajectory_tokens,
+                effective_model_context_window_tokens,
+                cli_config.max_tokens,
+                safety_tokens,
             )
     builder = SyntheticFilesystemDatasetBuilder(
         index_jsonl=cli_config.index_jsonl,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import errno
 import gc
 import json
 import logging
@@ -1346,6 +1347,95 @@ class ReadOnlyAnswererWorkspaceTools:
         )
 
 
+class InMemoryAnswererWorkspaceTools:
+    def __init__(self, files: dict[str, str]):
+        self.files = {self._clean_path(path): text for path, text in files.items()}
+        self.dirs = self._build_dirs(self.files)
+
+    def _clean_path(self, path: str) -> str:
+        clean = str(path).strip() or "."
+        clean = clean.strip("\"'`")
+        clean = clean.replace("\\", "/")
+        while clean.startswith("./"):
+            clean = clean[2:]
+        clean = clean.lstrip("/")
+        if clean in {"", "."}:
+            return "."
+        parts = PurePosixPath(clean).parts
+        if any(part == ".." for part in parts):
+            raise ValueError(f"Path escapes workspace root: {path}")
+        return str(PurePosixPath(*parts))
+
+    def _build_dirs(self, files: dict[str, str]) -> set[str]:
+        dirs = {"."}
+        for path in files:
+            parent = PurePosixPath(path).parent
+            while str(parent) not in {"", "."}:
+                dirs.add(str(parent))
+                parent = parent.parent
+        return dirs
+
+    def list_files(self, path: str = ".") -> dict[str, Any]:
+        clean = self._clean_path(path)
+        if clean in self.files:
+            return {
+                "path": clean,
+                "type": "file",
+                "entries": [],
+            }
+        if clean not in self.dirs:
+            raise ValueError(f"Path not found: {path}")
+
+        entries_by_path: dict[str, str] = {}
+        prefix = "" if clean == "." else f"{clean}/"
+        for file_path in self.files:
+            if prefix and not file_path.startswith(prefix):
+                continue
+            remainder = file_path[len(prefix) :]
+            if not remainder:
+                continue
+            child_name = remainder.split("/", 1)[0]
+            child_path = child_name if clean == "." else str(PurePosixPath(clean) / child_name)
+            child_type = "file" if "/" not in remainder else "dir"
+            prev = entries_by_path.get(child_path)
+            if prev == "dir":
+                continue
+            if prev == "file" and child_type == "dir":
+                entries_by_path[child_path] = "dir"
+                continue
+            entries_by_path.setdefault(child_path, child_type)
+
+        entries = [
+            {"path": child_path, "type": child_type}
+            for child_path, child_type in sorted(
+                entries_by_path.items(), key=lambda item: (item[1] == "file", item[0].lower())
+            )
+        ]
+        return {
+            "path": clean,
+            "type": "dir",
+            "entries": entries,
+        }
+
+    def read_file(self, path: str, start_line: int = 1, num_lines: int = READ_FILE_MAX_LINES) -> dict[str, Any]:
+        clean = self._clean_path(path)
+        if clean not in self.files:
+            if clean in self.dirs:
+                raise ValueError(f"Path is not a file: {path}")
+            raise ValueError(f"Path not found: {path}")
+        if start_line < 1:
+            raise ValueError(f"start_line must be >= 1, got {start_line}")
+        if num_lines < 1:
+            raise ValueError(f"num_lines must be >= 1, got {num_lines}")
+        num_lines = min(num_lines, READ_FILE_MAX_LINES)
+        return _read_text_line_window(
+            path=clean,
+            text=self.files[clean],
+            start_line=start_line,
+            num_lines=num_lines,
+        )
+
+
 @dataclass(frozen=True)
 class FrozenSyntheticFileExecutor:
     """External frozen-model executor that writes synthetic files from planner-selected sources."""
@@ -2563,6 +2653,14 @@ class SyntheticFilesystemReward:
     def _check_answer(self, model_answer: str) -> bool:
         return normalize_answer(model_answer) == normalize_answer(self.gold_answer)
 
+    def _answerer_workspace_files(self) -> dict[str, str]:
+        files = {"README.md": self.state.generate_readme()}
+        for rec in self.state.active_records():
+            files[self.state.workspace_relative_path(rec.node_id)] = (
+                self.state.render_final_workspace_file(rec)
+            )
+        return files
+
     async def _llm_judge_score(self, model_answer: str) -> float:
         prompt = (
             "You are judging whether a predicted answer should count as correct for a question. "
@@ -2592,14 +2690,25 @@ class SyntheticFilesystemReward:
 
     async def _run_answerer(self) -> dict[str, Any]:
         with tempfile.TemporaryDirectory(prefix="synthetic_fs_answerer_") as tmpdir:
-            workspace_root = self.state.materialize_final_workspace(
-                Path(tmpdir) / "final_workspace",
-                mode=self.answerer_workspace_mode,
-            )
-            tools = ReadOnlyAnswererWorkspaceTools(workspace_root)
             root_bootstrap_entries = self.state.answerer_bootstrap_entries()
+            try:
+                workspace_root = self.state.materialize_final_workspace(
+                    Path(tmpdir) / "final_workspace",
+                    mode=self.answerer_workspace_mode,
+                )
+                tools = ReadOnlyAnswererWorkspaceTools(workspace_root)
+                readme_text = (workspace_root / "README.md").read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                if exc.errno != errno.ENAMETOOLONG:
+                    raise
+                LOGGER.warning(
+                    "Falling back to in-memory answerer workspace after "
+                    "path materialization hit ENAMETOOLONG"
+                )
+                workspace_files = self._answerer_workspace_files()
+                tools = InMemoryAnswererWorkspaceTools(workspace_files)
+                readme_text = workspace_files["README.md"].strip()
 
-            readme_text = (workspace_root / "README.md").read_text(encoding="utf-8").strip()
             bootstrap_blocks = [
                 "[README.md]",
                 readme_text,
