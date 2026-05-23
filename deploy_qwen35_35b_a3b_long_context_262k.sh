@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${MODAL_VLLM_MODEL_NAME:=Qwen/Qwen3.5-35B-A3B}"
+: "${MODAL_VLLM_APP_NAME:=lateral-vllm-qwen3-5-35b-a3b-long-context-262k}"
+: "${MODAL_VLLM_WEB_LABEL:=${MODAL_VLLM_APP_NAME}}"
+: "${MODAL_VLLM_REQUIRES_PROXY_AUTH:=0}"
+: "${MODAL_VLLM_MIN_CONTAINERS:=1}"
+: "${MODAL_VLLM_MAX_CONTAINERS:=1}"
+: "${MODAL_VLLM_N_GPU:=8}"
+: "${MODAL_VLLM_TENSOR_PARALLEL_SIZE:=8}"
+: "${MODAL_VLLM_DATA_PARALLEL_SIZE:=1}"
+: "${MODAL_VLLM_MAX_MODEL_LEN:=262144}"
+
+export MODAL_VLLM_MODEL_NAME
+export MODAL_VLLM_APP_NAME
+export MODAL_VLLM_WEB_LABEL
+export MODAL_VLLM_REQUIRES_PROXY_AUTH
+export MODAL_VLLM_MIN_CONTAINERS
+export MODAL_VLLM_MAX_CONTAINERS
+export MODAL_VLLM_N_GPU
+export MODAL_VLLM_TENSOR_PARALLEL_SIZE
+export MODAL_VLLM_DATA_PARALLEL_SIZE
+export MODAL_VLLM_MAX_MODEL_LEN
+
+modal deploy \
+  --name "${MODAL_VLLM_APP_NAME}" \
+  /iris/u/asap7772/asmr_private/modal_launch_vllm_qwen35_35b_a3b_long_context.py
