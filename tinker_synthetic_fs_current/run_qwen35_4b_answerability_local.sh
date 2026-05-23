@@ -70,6 +70,28 @@ MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3.5-4B}"
 MODEL_CONTEXT_WINDOW_TOKENS="${MODEL_CONTEXT_WINDOW_TOKENS:-65536}"
 CONTEXT_WINDOW_SAFETY_TOKENS="${CONTEXT_WINDOW_SAFETY_TOKENS:-256}"
 MAX_TRAJECTORY_TOKENS="${MAX_TRAJECTORY_TOKENS:-140000}"
+MAX_TURNS="${MAX_TURNS:-32}"
+if [ -n "${MAX_TURNS_SWEEP:-}" ]; then
+  read -r -a SWEEP_MAX_TURNS_VALUES <<< "$MAX_TURNS_SWEEP"
+elif [ -n "${SWEEP_MAX_TURNS:-}" ]; then
+  read -r -a SWEEP_MAX_TURNS_VALUES <<< "$SWEEP_MAX_TURNS"
+else
+  SWEEP_MAX_TURNS_VALUES=("$MAX_TURNS")
+fi
+if [ "${#SWEEP_MAX_TURNS_VALUES[@]}" -eq 0 ]; then
+  echo "MAX_TURNS_SWEEP must contain at least one positive integer." >&2
+  exit 2
+fi
+for max_turns_value in "${SWEEP_MAX_TURNS_VALUES[@]}"; do
+  if ! [[ "$max_turns_value" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MAX_TURNS_SWEEP values must be positive integers, got: $max_turns_value" >&2
+    exit 2
+  fi
+done
+if [ -n "${ANSWERER_MAX_TURNS:-}" ] && ! [[ "$ANSWERER_MAX_TURNS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ANSWERER_MAX_TURNS must be a positive integer, got: $ANSWERER_MAX_TURNS" >&2
+  exit 2
+fi
 RUN_ROOT="${RUN_ROOT:-$REPO_ROOT/tinker_runs}"
 SHELL_LOG_DIR="${SHELL_LOG_DIR:-$RUN_ROOT/shell_logs}"
 
@@ -142,10 +164,12 @@ run_one_dataset() {
   local dataset_slug="$2"
   local train_index_jsonl="$3"
   local eval_index_jsonl="$4"
-  local run_name="$5"
-  local run_dir="$6"
-  local ram_spool_dir="$7"
-  local shell_log="$8"
+  local max_turns="$5"
+  local answerer_max_turns="$6"
+  local run_name="$7"
+  local run_dir="$8"
+  local ram_spool_dir="$9"
+  local shell_log="${10}"
 
   mkdir -p "$(dirname "$ram_spool_dir")" "$(dirname "$shell_log")"
 
@@ -158,6 +182,8 @@ run_one_dataset() {
   echo "TRAIN_INDEX_JSONL=$train_index_jsonl"
   echo "EVAL_INDEX_JSONL=$eval_index_jsonl"
   echo "MODEL_NAME=$MODEL_NAME"
+  echo "MAX_TURNS=$max_turns"
+  echo "ANSWERER_MAX_TURNS=$answerer_max_turns"
   echo "MODEL_CONTEXT_WINDOW_TOKENS=$MODEL_CONTEXT_WINDOW_TOKENS"
   echo "CONTEXT_WINDOW_SAFETY_TOKENS=$CONTEXT_WINDOW_SAFETY_TOKENS"
   echo "MAX_TRAJECTORY_TOKENS=$MAX_TRAJECTORY_TOKENS"
@@ -192,7 +218,7 @@ run_one_dataset() {
     eval_size=0 \
     batch_size=16 \
     group_size=4 \
-    max_turns=32 \
+    max_turns="$max_turns" \
     max_trajectory_tokens="$MAX_TRAJECTORY_TOKENS" \
     model_context_window_tokens="$MODEL_CONTEXT_WINDOW_TOKENS" \
     context_window_safety_tokens="$CONTEXT_WINDOW_SAFETY_TOKENS" \
@@ -215,7 +241,7 @@ run_one_dataset() {
     builder_executor_base_url="$BUILDER_EXECUTOR_BASE_URL" \
     builder_executor_api_key_env="$BUILDER_EXECUTOR_API_KEY_ENV" \
     reward_mode=hybrid \
-    answerer_max_turns=32 \
+    answerer_max_turns="$answerer_max_turns" \
     answerer_workspace_mode=synthetic_only \
     answerer_final_answer_max_tokens=128 \
     answerer_retrieval_cost_token_unit=1000 \
@@ -279,6 +305,8 @@ echo "SWEEP_ID=$SWEEP_ID"
 echo "RUN_NAME_PREFIX=$RUN_NAME_PREFIX"
 echo "SWEEP_INDEX=${SWEEP_INDEX:-all}"
 echo "SWEEP_DATASETS=${SWEEP_DATASET_PATHS[*]}"
+echo "MAX_TURNS_SWEEP=${SWEEP_MAX_TURNS_VALUES[*]}"
+echo "ANSWERER_MAX_TURNS=${ANSWERER_MAX_TURNS:-follow_max_turns}"
 echo "MODEL_NAME=$MODEL_NAME"
 echo "DATA_ROOT=$DATA_ROOT"
 echo "AGENT_DIR=$AGENT_DIR"
@@ -295,17 +323,35 @@ echo "Extra train args: ${EXTRA_ARGS[*]}"
 
 pids=()
 run_names=()
+selected_dataset_paths=()
+selected_max_turns=()
+turn_sweep_size="${#SWEEP_MAX_TURNS_VALUES[@]}"
+total_sweep_size=$((${#SWEEP_DATASET_PATHS[@]} * turn_sweep_size))
+echo "TOTAL_SWEEP_ENTRIES=$total_sweep_size"
 if [ -n "$SWEEP_INDEX" ]; then
-  if [ "$SWEEP_INDEX" -ge "${#SWEEP_DATASET_PATHS[@]}" ]; then
-    echo "Sweep index $SWEEP_INDEX is out of range for ${#SWEEP_DATASET_PATHS[@]} datasets." >&2
+  if [ "$SWEEP_INDEX" -ge "$total_sweep_size" ]; then
+    echo "Sweep index $SWEEP_INDEX is out of range for $total_sweep_size sweep entries." >&2
     exit 4
   fi
-  selected_dataset_paths=("${SWEEP_DATASET_PATHS[$SWEEP_INDEX]}")
+  dataset_index=$((SWEEP_INDEX / turn_sweep_size))
+  turn_index=$((SWEEP_INDEX % turn_sweep_size))
+  echo "SELECTED_DATASET_INDEX=$dataset_index"
+  echo "SELECTED_TURN_INDEX=$turn_index"
+  selected_dataset_paths=("${SWEEP_DATASET_PATHS[$dataset_index]}")
+  selected_max_turns=("${SWEEP_MAX_TURNS_VALUES[$turn_index]}")
 else
-  selected_dataset_paths=("${SWEEP_DATASET_PATHS[@]}")
+  for dataset_path in "${SWEEP_DATASET_PATHS[@]}"; do
+    for max_turns in "${SWEEP_MAX_TURNS_VALUES[@]}"; do
+      selected_dataset_paths+=("$dataset_path")
+      selected_max_turns+=("$max_turns")
+    done
+  done
 fi
 
-for dataset_path in "${selected_dataset_paths[@]}"; do
+for sweep_i in "${!selected_dataset_paths[@]}"; do
+  dataset_path="${selected_dataset_paths[$sweep_i]}"
+  max_turns="${selected_max_turns[$sweep_i]}"
+  answerer_max_turns="${ANSWERER_MAX_TURNS:-$max_turns}"
   if [ -n "${INDEX_JSONL:-}" ]; then
     train_index_jsonl="$INDEX_JSONL"
   else
@@ -322,27 +368,30 @@ for dataset_path in "${selected_dataset_paths[@]}"; do
   fi
 
   dataset_slug="$(slug_for_dataset "$dataset_path")"
+  turn_slug="mt${max_turns}_ans${answerer_max_turns}"
   if [ -n "${RUN_NAME:-}" ]; then
-    run_name="${RUN_NAME}_${dataset_slug}"
+    run_name="${RUN_NAME}_${dataset_slug}_${turn_slug}"
   else
-    run_name="${RUN_NAME_PREFIX}_${dataset_slug}_${SWEEP_ID}"
+    run_name="${RUN_NAME_PREFIX}_${dataset_slug}_${turn_slug}_${SWEEP_ID}"
   fi
   run_dir="${RUN_DIR:-$RUN_ROOT/$run_name}"
   if [ -n "${RUN_DIR:-}" ]; then
-    run_dir="$RUN_DIR/$dataset_slug"
+    run_dir="$RUN_DIR/${dataset_slug}_${turn_slug}"
   fi
   ram_spool_dir="${RAM_SPOOL_DIR:-/scr/asap7772/tinker_synthfs_spool/$run_name}"
   if [ -n "${RAM_SPOOL_DIR:-}" ]; then
-    ram_spool_dir="$RAM_SPOOL_DIR/$dataset_slug"
+    ram_spool_dir="$RAM_SPOOL_DIR/${dataset_slug}_${turn_slug}"
   fi
   shell_log="$SHELL_LOG_DIR/${run_name}.train.log"
 
-  echo "Launching $run_name with train_index_jsonl=$train_index_jsonl eval_index_jsonl=$eval_index_jsonl"
+  echo "Launching $run_name with max_turns=$max_turns answerer_max_turns=$answerer_max_turns train_index_jsonl=$train_index_jsonl eval_index_jsonl=$eval_index_jsonl"
   run_one_dataset \
     "$dataset_path" \
     "$dataset_slug" \
     "$train_index_jsonl" \
     "$eval_index_jsonl" \
+    "$max_turns" \
+    "$answerer_max_turns" \
     "$run_name" \
     "$run_dir" \
     "$ram_spool_dir" \
