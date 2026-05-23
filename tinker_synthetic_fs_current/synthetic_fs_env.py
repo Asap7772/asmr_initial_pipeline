@@ -50,6 +50,72 @@ BAD_SYNTHETIC_TEXT_VALUES = {"", "none", "null", "n/a", "na"}
 LOGGER = logging.getLogger(__name__)
 
 
+def _format_line_window_payload(
+    *,
+    path: str,
+    start_line: int,
+    chunk_lines: list[str],
+    total_lines: int,
+) -> dict[str, Any]:
+    content = "\n".join(chunk_lines)
+    truncated_by_chars = False
+    if len(content) > READ_FILE_MAX_CHARS:
+        content = content[:READ_FILE_MAX_CHARS].rstrip()
+        truncated_by_chars = True
+    end_line = start_line + len(chunk_lines) - 1 if chunk_lines else start_line - 1
+    return {
+        "path": path,
+        "start_line": start_line,
+        "end_line": end_line,
+        "total_lines": total_lines,
+        "has_more": end_line < total_lines or truncated_by_chars,
+        "truncated_by_chars": truncated_by_chars,
+        "content": content,
+    }
+
+
+def _read_text_line_window(
+    *,
+    path: str,
+    text: str,
+    start_line: int,
+    num_lines: int,
+) -> dict[str, Any]:
+    all_lines = text.splitlines()
+    start_index = start_line - 1
+    chunk_lines = all_lines[start_index : start_index + num_lines]
+    return _format_line_window_payload(
+        path=path,
+        start_line=start_line,
+        chunk_lines=chunk_lines,
+        total_lines=len(all_lines),
+    )
+
+
+def _read_file_line_window(
+    *,
+    path: str,
+    file_path: Path,
+    start_line: int,
+    num_lines: int,
+) -> dict[str, Any]:
+    chunk_lines: list[str] = []
+    start_index = start_line - 1
+    stop_index = start_index + num_lines
+    total_lines = 0
+    with file_path.open(encoding="utf-8") as handle:
+        for total_lines, line in enumerate(handle, start=1):
+            line_index = total_lines - 1
+            if start_index <= line_index < stop_index:
+                chunk_lines.append(line.rstrip("\r\n"))
+    return _format_line_window_payload(
+        path=path,
+        start_line=start_line,
+        chunk_lines=chunk_lines,
+        total_lines=total_lines,
+    )
+
+
 def _normalize_model_http_url(url: str) -> str:
     url = url.strip()
     if url.startswith("//"):
@@ -786,29 +852,22 @@ class SyntheticFilesystemState:
                 path = raw_path_match
             raw_doc_path = self.resolve_raw_doc(path)
             path = f"raw_docs/{raw_doc_path.relative_to(self.raw_doc_root.resolve())}"
-            text = raw_doc_path.read_text(encoding="utf-8")
+            return _read_file_line_window(
+                path=path,
+                file_path=raw_doc_path,
+                start_line=start_line,
+                num_lines=num_lines,
+            )
         else:
             rec = self.resolve_synthetic_node(path)
             path = self.history_path(rec.node_id) if path.startswith("history/") or not rec.active else self.active_path(rec.node_id)
             text = self.render_synthetic_file(rec)
-        all_lines = text.splitlines()
-        start_index = start_line - 1
-        chunk_lines = all_lines[start_index : start_index + num_lines]
-        content = "\n".join(chunk_lines)
-        truncated_by_chars = False
-        if len(content) > READ_FILE_MAX_CHARS:
-            content = content[:READ_FILE_MAX_CHARS].rstrip()
-            truncated_by_chars = True
-        end_line = start_line + len(chunk_lines) - 1 if chunk_lines else start_line - 1
-        return {
-            "path": path,
-            "start_line": start_line,
-            "end_line": end_line,
-            "total_lines": len(all_lines),
-            "has_more": end_line < len(all_lines) or truncated_by_chars,
-            "truncated_by_chars": truncated_by_chars,
-            "content": content,
-        }
+        return _read_text_line_window(
+            path=path,
+            text=text,
+            start_line=start_line,
+            num_lines=num_lines,
+        )
 
     def _tree_lines(self, parent_id: str | None = None, indent: int = 0) -> list[str]:
         lines: list[str] = []
@@ -1279,24 +1338,12 @@ class ReadOnlyAnswererWorkspaceTools:
         if num_lines < 1:
             raise ValueError(f"num_lines must be >= 1, got {num_lines}")
         num_lines = min(num_lines, READ_FILE_MAX_LINES)
-        all_lines = target.read_text(encoding="utf-8").splitlines()
-        start_index = start_line - 1
-        chunk_lines = all_lines[start_index : start_index + num_lines]
-        content = "\n".join(chunk_lines)
-        truncated_by_chars = False
-        if len(content) > READ_FILE_MAX_CHARS:
-            content = content[:READ_FILE_MAX_CHARS].rstrip()
-            truncated_by_chars = True
-        end_line = start_line + len(chunk_lines) - 1 if chunk_lines else start_line - 1
-        return {
-            "path": path,
-            "start_line": start_line,
-            "end_line": end_line,
-            "total_lines": len(all_lines),
-            "has_more": end_line < len(all_lines) or truncated_by_chars,
-            "truncated_by_chars": truncated_by_chars,
-            "content": content,
-        }
+        return _read_file_line_window(
+            path=path,
+            file_path=target,
+            start_line=start_line,
+            num_lines=num_lines,
+        )
 
 
 @dataclass(frozen=True)

@@ -21,16 +21,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", default="../data/tinker_synthetic_fs_alltrain")
     parser.add_argument(
         "--heldout-questions-json",
-        default="",
+        default="/iris/u/asap7772/asmr_private/data/heldout_50_questions.json",
         help=(
             "Optional JSON file containing held-out question_id/query_id values. "
             "When set with --eval-out-dir, these rows are written to the eval index "
             "and excluded from the train index."
         ),
     )
-    parser.add_argument("--eval-out-dir", default="")
+    parser.add_argument("--eval-out-dir", default="../data/tinker_synthetic_fs_alltest")
     parser.add_argument("--limit", type=int, default=0)
-    return parser.parse_args()
+    parser.add_argument(
+        "--max-documents",
+        "--max-docs",
+        dest="max_documents",
+        type=int,
+        default=0,
+        help=(
+            "Maximum number of agent-visible documents per question. "
+            "When a row exceeds this cap, negative_docs are pruned first. "
+            "Set to 0 to disable document pruning."
+        ),
+    )
+    parser.add_argument(
+        "--evidence-gold-only",
+        type=bool,
+        help="Keep only documents labeled evidence_docs or gold_docs.",
+        default=False,
+    )
+    args = parser.parse_args()
+    if args.limit < 0:
+        parser.error("--limit must be >= 0")
+    if args.max_documents < 0:
+        parser.error("--max-documents must be >= 0")
+    return args
 
 
 def qid_sort_key(path: Path) -> tuple[int, int | str]:
@@ -92,7 +115,50 @@ def load_document_metadata(privileged_query_dir: Path, qid: str) -> dict[str, di
     return by_relative_path
 
 
-def build_row(agent_query_dir: Path, privileged_query_dir: Path) -> dict[str, Any]:
+def prune_negative_documents(
+    files: list[dict[str, Any]], max_documents: int, qid: str
+) -> list[dict[str, Any]]:
+    if max_documents <= 0 or len(files) <= max_documents:
+        return files
+
+    protected_count = sum(1 for file in files if not file.get("is_negative", False))
+    if protected_count > max_documents:
+        raise ValueError(
+            f"Cannot limit {qid} to {max_documents} documents without pruning "
+            f"non-negative documents ({protected_count} non-negative docs present)."
+        )
+
+    negatives_to_keep = max_documents - protected_count
+    kept_negatives = 0
+    pruned_files: list[dict[str, Any]] = []
+    for file in files:
+        if file.get("is_negative", False):
+            if kept_negatives >= negatives_to_keep:
+                continue
+            kept_negatives += 1
+        pruned_files.append(file)
+    return pruned_files
+
+
+def keep_evidence_gold_documents(
+    files: list[dict[str, Any]], qid: str
+) -> list[dict[str, Any]]:
+    kept_files = [
+        file
+        for file in files
+        if file.get("label") in {"evidence_docs", "gold_docs"}
+    ]
+    if not kept_files:
+        raise ValueError(f"No evidence_docs or gold_docs found for {qid}.")
+    return kept_files
+
+
+def build_row(
+    agent_query_dir: Path,
+    privileged_query_dir: Path,
+    max_documents: int = 0,
+    evidence_gold_only: bool = False,
+) -> dict[str, Any]:
     qid = agent_query_dir.name
     query_path = privileged_query_dir / "query.txt"
     answer_path = privileged_query_dir / "answer.txt"
@@ -120,6 +186,10 @@ def build_row(agent_query_dir: Path, privileged_query_dir: Path) -> dict[str, An
 
     if not files:
         raise ValueError(f"No agent-visible files found for {qid}: {agent_query_dir}")
+
+    if evidence_gold_only:
+        files = keep_evidence_gold_documents(files, qid)
+    files = prune_negative_documents(files, max_documents, qid)
 
     return {
         "question_id": qid,
@@ -173,7 +243,14 @@ def main() -> None:
         privileged_query_dir = privileged_dir / agent_query_dir.name
         if not privileged_query_dir.exists():
             raise ValueError(f"Missing privileged dir for {agent_query_dir.name}: {privileged_query_dir}")
-        all_rows.append(build_row(agent_query_dir, privileged_query_dir))
+        all_rows.append(
+            build_row(
+                agent_query_dir,
+                privileged_query_dir,
+                max_documents=args.max_documents,
+                evidence_gold_only=args.evidence_gold_only,
+            )
+        )
         if args.limit and len(all_rows) >= args.limit:
             break
 
@@ -195,6 +272,8 @@ def main() -> None:
         if args.heldout_questions_json
         else "",
         "heldout_qids": len(heldout_qids),
+        "max_documents": args.max_documents,
+        "evidence_gold_only": args.evidence_gold_only,
     }
     train_index = write_index(Path(args.out_dir), train_rows, source=source)
     print(f"wrote train index: {train_index}")
