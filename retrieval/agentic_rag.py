@@ -12,16 +12,19 @@ from typing import Any
 
 import torch
 from tqdm import tqdm
+from vllm import SamplingParams
 
 try:
     from retrieval.answer_proc_heldout import (
+        AnswerPrompt,
+        DEFAULT_LOCAL_MODEL,
+        QwenAnswerAgent,
         answer_records,
         load_env_file,
         resolve_reasoning_arg,
     )
     from retrieval.retrieve_proc_heldout import (
         DEFAULT_DOCS_DIR,
-        DEFAULT_GOLD_AND_SUPPORT_ONLY,
         DEFAULT_PRIVILEGED_DIR,
         DEFAULT_QUESTIONS_PATH,
         CandidateDocument,
@@ -41,13 +44,15 @@ except ModuleNotFoundError as exc:
     }:
         raise
     from answer_proc_heldout import (
+        AnswerPrompt,
+        DEFAULT_LOCAL_MODEL,
+        QwenAnswerAgent,
         answer_records,
         load_env_file,
         resolve_reasoning_arg,
     )
     from retrieve_proc_heldout import (
         DEFAULT_DOCS_DIR,
-        DEFAULT_GOLD_AND_SUPPORT_ONLY,
         DEFAULT_PRIVILEGED_DIR,
         DEFAULT_QUESTIONS_PATH,
         CandidateDocument,
@@ -85,9 +90,11 @@ logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_AGENT_PROMPT_PATH = REPO_ROOT / "retrieval" / "agentic_rag_query.md"
-DEFAULT_RETRIEVAL_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_agentic_retrieval_gemini.jsonl"
-DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_agentic_answers_gemini.jsonl"
-DEFAULT_NON_LOCAL_ANSWERER=True
+DEFAULT_RETRIEVAL_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_agentic_retrieval_qwen.jsonl"
+DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_agentic_answers_qwen.jsonl"
+DEFAULT_GOLD_AND_SUPPORT_ONLY=True
+DEFAULT_NON_LOCAL_AGENT = False
+DEFAULT_NON_LOCAL_ANSWERER = False
 
 @dataclass(frozen=True)
 class SearchHit:
@@ -185,6 +192,7 @@ class AgenticQueryPlanner:
         self.config = get_provider_config(provider)
         self.model_name = model_name or self.config.default_model
         self.client = create_async_client(self.config)
+        self.provider_name = self.config.name
         self.max_completion_tokens = max_completion_tokens
         self.reasoning_effort = reasoning_effort
         self.use_cache = use_cache
@@ -211,6 +219,64 @@ class AgenticQueryPlanner:
             pass
 
 
+class LocalAgenticQueryPlanner:
+    def __init__(
+        self,
+        model_name_or_path: str,
+        *,
+        tensor_parallel_size: int | None,
+        max_model_len: int,
+        gpu_memory_utilization: float,
+        dtype: str,
+        trust_remote_code: bool,
+        distributed_executor_backend: str | None,
+        disable_thinking: bool,
+        max_completion_tokens: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+    ) -> None:
+        self.provider_name = "local"
+        self.model_name = model_name_or_path
+        self.agent = QwenAnswerAgent(
+            model_name_or_path,
+            tensor_parallel_size=tensor_parallel_size,
+            max_model_len=max_model_len,
+            gpu_memory_utilization=gpu_memory_utilization,
+            dtype=dtype,
+            trust_remote_code=trust_remote_code,
+            distributed_executor_backend=distributed_executor_backend,
+            disable_thinking=disable_thinking,
+        )
+
+        sampling_kwargs: dict[str, Any] = {
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_tokens": max_completion_tokens,
+        }
+        if top_k > 0:
+            sampling_kwargs["top_k"] = top_k
+        self.sampling_params = SamplingParams(**sampling_kwargs)
+
+    def propose(self, prompt: str) -> str:
+        prompt_record = AnswerPrompt(
+            messages=[{"role": "user", "content": prompt}],
+            prompt_documents=[],
+            prompt_token_count=0,
+        )
+        generations = self.agent.generate([prompt_record], self.sampling_params)
+        if not generations:
+            return ""
+        generation = generations[0]
+        return str(generation.get("response") or generation.get("raw_response") or "")
+
+    def stop(self) -> None:
+        try:
+            self.agent.stop()
+        except Exception:
+            pass
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run agentic query expansion RAG, then answer and judge heldout questions."
@@ -222,23 +288,49 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-path", type=Path, default=DEFAULT_OUTPUT_PATH)
 
     parser.add_argument("--agent-prompt-path", type=Path, default=DEFAULT_AGENT_PROMPT_PATH)
+    parser.add_argument(
+        "--non-local-agent",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_NON_LOCAL_AGENT,
+        help=(
+            "Use inference.collect_llm for the query-planning agent. "
+            "Pass --no-non-local-agent to run the agent with local vLLM/Qwen."
+        ),
+    )
     parser.add_argument("--agent-provider", default="gemini")
-    parser.add_argument("--agent-model-name", default="")
+    parser.add_argument(
+        "--agent-model-name",
+        default="",
+        help=(
+            "Defaults to the selected provider's model for --non-local-agent, "
+            f"or {DEFAULT_LOCAL_MODEL} for --no-non-local-agent."
+        ),
+    )
     parser.add_argument("--agent-max-completion-tokens", type=int, default=1024)
     parser.add_argument(
         "--agent-reasoning-effort",
         default="provider_default",
-        help="Use 'none', 'provider_default', or a provider-supported effort value.",
+        help="For --non-local-agent: use 'none', 'provider_default', or a provider-supported effort value.",
     )
     parser.add_argument(
         "--agent-use-cache",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Cache query-planner responses through inference.collect_llm.",
+        help="For --non-local-agent: cache query-planner responses through inference.collect_llm.",
     )
+    parser.add_argument("--agent-tensor-parallel-size", type=int, default=None)
+    parser.add_argument("--agent-distributed-executor-backend", default=None)
+    parser.add_argument("--agent-max-model-len", type=int, default=32768)
+    parser.add_argument("--agent-gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--agent-dtype", default="auto")
+    parser.add_argument("--agent-trust-remote-code", action="store_true")
+    parser.add_argument("--agent-temperature", type=float, default=0.0)
+    parser.add_argument("--agent-top-p", type=float, default=1.0)
+    parser.add_argument("--agent-top-k", type=int, default=-1)
+    parser.add_argument("--agent-disable-thinking", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--max-iterations", type=int, default=4)
-    parser.add_argument("--search-top-k", type=int, default=10)
-    parser.add_argument("--final-top-k", type=int, default=20)
+    parser.add_argument("--search-top-k", type=int, default=5)
+    parser.add_argument("--final-top-k", type=int, default=5)
     parser.add_argument("--agent-observation-docs", type=int, default=5)
     parser.add_argument("--agent-context-docs", type=int, default=12)
     parser.add_argument("--agent-max-snippet-chars", type=int, default=900)
@@ -308,6 +400,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
+    if args.agent_max_completion_tokens < 1:
+        parser.error("--agent-max-completion-tokens must be at least 1")
+    if args.agent_tensor_parallel_size is not None and args.agent_tensor_parallel_size < 1:
+        parser.error("--agent-tensor-parallel-size must be at least 1")
+    if not args.non_local_agent and args.agent_max_model_len <= args.agent_max_completion_tokens:
+        parser.error("--agent-max-model-len must be greater than --agent-max-completion-tokens")
     if args.max_iterations < 0:
         parser.error("--max-iterations must be >= 0")
     if args.search_top_k < 1:
@@ -673,12 +771,57 @@ def search_step_record(
     }
 
 
+QueryPlanner = AgenticQueryPlanner | LocalAgenticQueryPlanner
+
+
+def resolve_agent_model(args: argparse.Namespace) -> str:
+    if args.agent_model_name:
+        return args.agent_model_name
+    if args.non_local_agent:
+        return get_provider_config(args.agent_provider).default_model
+    return DEFAULT_LOCAL_MODEL
+
+
+def build_agentic_query_planner(args: argparse.Namespace) -> QueryPlanner:
+    agent_model = resolve_agent_model(args)
+    if args.non_local_agent:
+        return AgenticQueryPlanner(
+            args.agent_provider,
+            agent_model,
+            max_completion_tokens=args.agent_max_completion_tokens,
+            reasoning_effort=resolve_reasoning_arg(args.agent_reasoning_effort),
+            use_cache=args.agent_use_cache,
+        )
+
+    return LocalAgenticQueryPlanner(
+        agent_model,
+        tensor_parallel_size=args.agent_tensor_parallel_size,
+        max_model_len=args.agent_max_model_len,
+        gpu_memory_utilization=args.agent_gpu_memory_utilization,
+        dtype=args.agent_dtype,
+        trust_remote_code=args.agent_trust_remote_code,
+        distributed_executor_backend=args.agent_distributed_executor_backend,
+        disable_thinking=args.agent_disable_thinking,
+        max_completion_tokens=args.agent_max_completion_tokens,
+        temperature=args.agent_temperature,
+        top_p=args.agent_top_p,
+        top_k=args.agent_top_k,
+    )
+
+
+def stop_component(name: str, component: Any) -> None:
+    try:
+        component.stop()
+    except Exception:
+        logger.exception("Failed to stop %s cleanly", name)
+
+
 def run_agentic_retrieval_for_question(
     *,
     question_entry: dict[str, str],
     documents: list[CandidateDocument],
     embedding_model: Qwen3EmbeddingVllm,
-    planner: AgenticQueryPlanner,
+    planner: QueryPlanner,
     system_prompt: str,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
@@ -763,7 +906,8 @@ def run_agentic_retrieval_for_question(
         "top_k": args.final_top_k,
         "retrieval_top_k": args.search_top_k,
         "agentic": True,
-        "agent_provider": planner.config.name,
+        "agent_non_local": bool(args.non_local_agent),
+        "agent_provider": planner.provider_name,
         "agent_model": planner.model_name,
         "agent_max_iterations": args.max_iterations,
         "agent_num_iterations": len(planner_steps),
@@ -793,23 +937,21 @@ def run_agentic_retrieval(args: argparse.Namespace) -> list[dict[str, Any]]:
         top_k=args.final_top_k,
         with_init_docs=args.initial_search,
     )
-    planner = AgenticQueryPlanner(
-        args.agent_provider,
-        args.agent_model_name,
-        max_completion_tokens=args.agent_max_completion_tokens,
-        reasoning_effort=resolve_reasoning_arg(args.agent_reasoning_effort),
-        use_cache=args.agent_use_cache,
-    )
-    embedding_model = Qwen3EmbeddingVllm(
-        args.embedding_model_name_or_path,
-        instruction=args.embedding_instruction,
-        tensor_parallel_size=args.embedding_tensor_parallel_size,
-        max_model_len=args.embedding_max_model_len,
-        gpu_memory_utilization=args.embedding_gpu_memory_utilization,
-    )
-
+    planner: QueryPlanner | None = None
+    embedding_model: Qwen3EmbeddingVllm | None = None
     records: list[dict[str, Any]] = []
     try:
+        planner = build_agentic_query_planner(args)
+        embedding_model = Qwen3EmbeddingVllm(
+            args.embedding_model_name_or_path,
+            instruction=args.embedding_instruction,
+            tensor_parallel_size=args.embedding_tensor_parallel_size,
+            max_model_len=args.embedding_max_model_len,
+            gpu_memory_utilization=args.embedding_gpu_memory_utilization,
+        )
+        assert planner is not None
+        assert embedding_model is not None
+
         for question_entry in tqdm(questions, desc="Agentic retrieval"):
             question_id = question_entry["question_id"]
             try:
@@ -829,12 +971,14 @@ def run_agentic_retrieval(args: argparse.Namespace) -> list[dict[str, Any]]:
                     args=args,
                 )
             except Exception as exc:
+                assert planner is not None
                 logger.exception("Failed agentic retrieval for question %s", question_id)
                 record = {
                     "question_id": question_id,
                     "question": question_entry["question"],
                     "agentic": True,
-                    "agent_provider": planner.config.name,
+                    "agent_non_local": bool(args.non_local_agent),
+                    "agent_provider": planner.provider_name,
                     "agent_model": planner.model_name,
                     "gold_and_support_only": bool(args.gold_and_support_only),
                     "error": str(exc),
@@ -842,8 +986,10 @@ def run_agentic_retrieval(args: argparse.Namespace) -> list[dict[str, Any]]:
                 }
             records.append(record)
     finally:
-        planner.stop()
-        embedding_model.stop()
+        if planner is not None:
+            stop_component("agent planner", planner)
+        if embedding_model is not None:
+            stop_component("embedding model", embedding_model)
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
