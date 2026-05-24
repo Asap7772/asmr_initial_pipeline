@@ -72,6 +72,26 @@ CONTEXT_WINDOW_SAFETY_TOKENS="${CONTEXT_WINDOW_SAFETY_TOKENS:-256}"
 MAX_TRAJECTORY_TOKENS="${MAX_TRAJECTORY_TOKENS:-140000}"
 RAM_SPOOL_MINIBATCH_GROUPS="${RAM_SPOOL_MINIBATCH_GROUPS:-4}"
 RAM_SPOOL_MAX_CONCURRENT_GROUPS="${RAM_SPOOL_MAX_CONCURRENT_GROUPS:-4}"
+TERMINAL_ANSWERER_REPEATS="${TERMINAL_ANSWERER_REPEATS:-4}"
+ANSWERABILITY_PROBE_REPEATS="${ANSWERABILITY_PROBE_REPEATS:-4}"
+ANSWERABILITY_PROBE_MAX_PER_EPISODE="${ANSWERABILITY_PROBE_MAX_PER_EPISODE:-4}"
+ANSWERER_REPEAT_CONCURRENCY="${ANSWERER_REPEAT_CONCURRENCY:-2}"
+BUILDER_COMPACTION_TRIGGER_TOKENS="${BUILDER_COMPACTION_TRIGGER_TOKENS:-3000}"
+BUILDER_EXECUTOR_MAX_OUTPUT_TOKENS="${BUILDER_EXECUTOR_MAX_OUTPUT_TOKENS:-512}"
+MEMORY_GUARD_ENABLED="${MEMORY_GUARD_ENABLED:-true}"
+MEMORY_GUARD_POLL_SECONDS="${MEMORY_GUARD_POLL_SECONDS:-2}"
+MEMORY_GUARD_MAX_RSS_MB="${MEMORY_GUARD_MAX_RSS_MB:-0}"
+MEMORY_GUARD_MIN_SYSTEM_AVAILABLE_MB="${MEMORY_GUARD_MIN_SYSTEM_AVAILABLE_MB:-0}"
+MEMORY_GUARD_MIN_CGROUP_AVAILABLE_MB="${MEMORY_GUARD_MIN_CGROUP_AVAILABLE_MB:-0}"
+MEMORY_GUARD_MAX_CGROUP_USED_FRACTION="${MEMORY_GUARD_MAX_CGROUP_USED_FRACTION:-0.70}"
+MEMORY_GUARD_GRACEFUL_EXIT="${MEMORY_GUARD_GRACEFUL_EXIT:-true}"
+MEMORY_GUARD_EXIT_CODE="${MEMORY_GUARD_EXIT_CODE:-75}"
+MEMORY_GUARD_TRAIN_PARTIAL_BATCH="${MEMORY_GUARD_TRAIN_PARTIAL_BATCH:-false}"
+MEMORY_GUARD_RESTARTS="${MEMORY_GUARD_RESTARTS:-3}"
+MEMORY_GUARD_RESTART_SLEEP_SECONDS="${MEMORY_GUARD_RESTART_SLEEP_SECONDS:-30}"
+MEMORY_GUARD_REDUCE_CONCURRENCY_ON_RESTART="${MEMORY_GUARD_REDUCE_CONCURRENCY_ON_RESTART:-true}"
+AUTORESTART_EXIT_CODES="${AUTORESTART_EXIT_CODES:-$MEMORY_GUARD_EXIT_CODE 137}"
+LOGDIR_BEHAVIOR="${LOGDIR_BEHAVIOR:-resume}"
 MAX_TURNS="${MAX_TURNS:-32}"
 if [ -n "${MAX_TURNS_SWEEP:-}" ]; then
   read -r -a SWEEP_MAX_TURNS_VALUES <<< "$MAX_TURNS_SWEEP"
@@ -102,6 +122,48 @@ if ! [[ "$RAM_SPOOL_MINIBATCH_GROUPS" =~ ^[1-9][0-9]*$ ]]; then
   echo "RAM_SPOOL_MINIBATCH_GROUPS must be a positive integer, got: $RAM_SPOOL_MINIBATCH_GROUPS" >&2
   exit 2
 fi
+if ! [[ "$TERMINAL_ANSWERER_REPEATS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "TERMINAL_ANSWERER_REPEATS must be a positive integer, got: $TERMINAL_ANSWERER_REPEATS" >&2
+  exit 2
+fi
+if ! [[ "$ANSWERABILITY_PROBE_REPEATS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ANSWERABILITY_PROBE_REPEATS must be a positive integer, got: $ANSWERABILITY_PROBE_REPEATS" >&2
+  exit 2
+fi
+if ! [[ "$ANSWERER_REPEAT_CONCURRENCY" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ANSWERER_REPEAT_CONCURRENCY must be a positive integer, got: $ANSWERER_REPEAT_CONCURRENCY" >&2
+  exit 2
+fi
+if ! [[ "$ANSWERABILITY_PROBE_MAX_PER_EPISODE" =~ ^[0-9]+$ ]]; then
+  echo "ANSWERABILITY_PROBE_MAX_PER_EPISODE must be a non-negative integer, got: $ANSWERABILITY_PROBE_MAX_PER_EPISODE" >&2
+  exit 2
+fi
+if ! [[ "$BUILDER_COMPACTION_TRIGGER_TOKENS" =~ ^[0-9]+$ ]]; then
+  echo "BUILDER_COMPACTION_TRIGGER_TOKENS must be a non-negative integer, got: $BUILDER_COMPACTION_TRIGGER_TOKENS" >&2
+  exit 2
+fi
+if ! [[ "$BUILDER_EXECUTOR_MAX_OUTPUT_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "BUILDER_EXECUTOR_MAX_OUTPUT_TOKENS must be a positive integer, got: $BUILDER_EXECUTOR_MAX_OUTPUT_TOKENS" >&2
+  exit 2
+fi
+if ! [[ "$MEMORY_GUARD_EXIT_CODE" =~ ^[0-9]+$ ]] || [ "$MEMORY_GUARD_EXIT_CODE" -lt 1 ] || [ "$MEMORY_GUARD_EXIT_CODE" -gt 255 ]; then
+  echo "MEMORY_GUARD_EXIT_CODE must be an integer in [1, 255], got: $MEMORY_GUARD_EXIT_CODE" >&2
+  exit 2
+fi
+if ! [[ "$MEMORY_GUARD_RESTARTS" =~ ^[0-9]+$ ]]; then
+  echo "MEMORY_GUARD_RESTARTS must be a non-negative integer, got: $MEMORY_GUARD_RESTARTS" >&2
+  exit 2
+fi
+if ! [[ "$MEMORY_GUARD_RESTART_SLEEP_SECONDS" =~ ^[0-9]+$ ]]; then
+  echo "MEMORY_GUARD_RESTART_SLEEP_SECONDS must be a non-negative integer, got: $MEMORY_GUARD_RESTART_SLEEP_SECONDS" >&2
+  exit 2
+fi
+for restart_exit_code in $AUTORESTART_EXIT_CODES; do
+  if ! [[ "$restart_exit_code" =~ ^[0-9]+$ ]] || [ "$restart_exit_code" -lt 1 ] || [ "$restart_exit_code" -gt 255 ]; then
+    echo "AUTORESTART_EXIT_CODES entries must be integers in [1, 255], got: $restart_exit_code" >&2
+    exit 2
+  fi
+done
 RUN_ROOT="${RUN_ROOT:-$REPO_ROOT/tinker_runs}"
 SHELL_LOG_DIR="${SHELL_LOG_DIR:-$RUN_ROOT/shell_logs}"
 
@@ -169,6 +231,17 @@ slug_for_dataset() {
   printf '%s\n' "$dataset_base"
 }
 
+is_autorestart_exit_code() {
+  local status="$1"
+  local restart_exit_code
+  for restart_exit_code in $AUTORESTART_EXIT_CODES; do
+    if [ "$status" -eq "$restart_exit_code" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 run_one_dataset() {
   local dataset_path="$1"
   local dataset_slug="$2"
@@ -199,6 +272,18 @@ run_one_dataset() {
   echo "MAX_TRAJECTORY_TOKENS=$MAX_TRAJECTORY_TOKENS"
   echo "RAM_SPOOL_MINIBATCH_GROUPS=$RAM_SPOOL_MINIBATCH_GROUPS"
   echo "RAM_SPOOL_MAX_CONCURRENT_GROUPS=$RAM_SPOOL_MAX_CONCURRENT_GROUPS"
+  echo "TERMINAL_ANSWERER_REPEATS=$TERMINAL_ANSWERER_REPEATS"
+  echo "ANSWERABILITY_PROBE_REPEATS=$ANSWERABILITY_PROBE_REPEATS"
+  echo "ANSWERABILITY_PROBE_MAX_PER_EPISODE=$ANSWERABILITY_PROBE_MAX_PER_EPISODE"
+  echo "ANSWERER_REPEAT_CONCURRENCY=$ANSWERER_REPEAT_CONCURRENCY"
+  echo "BUILDER_COMPACTION_TRIGGER_TOKENS=$BUILDER_COMPACTION_TRIGGER_TOKENS"
+  echo "BUILDER_EXECUTOR_MAX_OUTPUT_TOKENS=$BUILDER_EXECUTOR_MAX_OUTPUT_TOKENS"
+  echo "MEMORY_GUARD_ENABLED=$MEMORY_GUARD_ENABLED"
+  echo "MEMORY_GUARD_MAX_CGROUP_USED_FRACTION=$MEMORY_GUARD_MAX_CGROUP_USED_FRACTION"
+  echo "MEMORY_GUARD_EXIT_CODE=$MEMORY_GUARD_EXIT_CODE"
+  echo "MEMORY_GUARD_RESTARTS=$MEMORY_GUARD_RESTARTS"
+  echo "AUTORESTART_EXIT_CODES=$AUTORESTART_EXIT_CODES"
+  echo "LOGDIR_BEHAVIOR=$LOGDIR_BEHAVIOR"
   echo "DATA_ROOT=$DATA_ROOT"
   echo "AGENT_DIR=$AGENT_DIR"
   echo "PRIVILEGED_DIR=$PRIVILEGED_DIR"
@@ -212,6 +297,14 @@ run_one_dataset() {
   echo "BUILDER_EXECUTOR_API_KEY_ENV=$BUILDER_EXECUTOR_API_KEY_ENV"
   echo "Extra train args: ${EXTRA_ARGS[*]}"
 
+  local memory_guard_attempt=0
+  local current_ram_spool_max_concurrent="$RAM_SPOOL_MAX_CONCURRENT_GROUPS"
+  local py_status=0
+  while :; do
+    echo "TRAIN_ATTEMPT=$((memory_guard_attempt + 1))"
+    echo "TRAIN_ATTEMPT_RAM_SPOOL_MAX_CONCURRENT_GROUPS=$current_ram_spool_max_concurrent"
+
+    set +e
   "${PYTHON_CMD[@]}" "$SCRIPT_DIR/train_synthetic_fs_rl.py" \
     model_name="$MODEL_NAME" \
     renderer_name=qwen3_5 \
@@ -236,14 +329,14 @@ run_one_dataset() {
     context_window_safety_tokens="$CONTEXT_WINDOW_SAFETY_TOKENS" \
     step_penalty=0.0 \
     raw_docs_penalty=0.0 \
-    builder_compaction_trigger_tokens=3000 \
+    builder_compaction_trigger_tokens="$BUILDER_COMPACTION_TRIGGER_TOKENS" \
     answerer_model=gemini-3.1-flash-lite-preview \
     judge_model=gemini-3.1-flash-lite-preview \
     builder_compaction_model=gemini-3.1-flash-lite-preview \
     builder_executor_enabled=true \
     builder_batch_tools_enabled=true \
     builder_executor_max_source_chars=16000 \
-    builder_executor_max_output_tokens=512 \
+    builder_executor_max_output_tokens="$BUILDER_EXECUTOR_MAX_OUTPUT_TOKENS" \
     builder_compaction_enabled=true \
     builder_compaction_keep_recent_turns=1 \
     builder_compaction_max_output_tokens=800 \
@@ -259,12 +352,13 @@ run_one_dataset() {
     answerer_retrieval_cost_token_unit=1000 \
     answerer_retrieval_cost_correct_only=true \
     answerer_synthetic_read_cost_unit=10 \
-    terminal_answerer_repeats=4 \
+    terminal_answerer_repeats="$TERMINAL_ANSWERER_REPEATS" \
     answerability_delta_reward_scale=1.0 \
     answerability_delta_min_abs=0.25 \
     answerability_delta_allow_negative=true \
-    answerability_probe_repeats=4 \
-    answerability_probe_max_per_episode=4 \
+    answerability_probe_repeats="$ANSWERABILITY_PROBE_REPEATS" \
+    answerer_repeat_concurrency="$ANSWERER_REPEAT_CONCURRENCY" \
+    answerability_probe_max_per_episode="$ANSWERABILITY_PROBE_MAX_PER_EPISODE" \
     answerability_probe_interval_turns=8 \
     answerability_probe_min_maturity=0.45 \
     filesystem_maturity_scale=0.0 \
@@ -304,14 +398,48 @@ run_one_dataset() {
     ram_spool_enabled=true \
     ram_spool_dir="$ram_spool_dir" \
     ram_spool_minibatch_groups="$RAM_SPOOL_MINIBATCH_GROUPS" \
-    ram_spool_max_concurrent_groups="$RAM_SPOOL_MAX_CONCURRENT_GROUPS" \
+    ram_spool_max_concurrent_groups="$current_ram_spool_max_concurrent" \
     ram_spool_cleanup=true \
+    memory_guard_enabled="$MEMORY_GUARD_ENABLED" \
+    memory_guard_poll_seconds="$MEMORY_GUARD_POLL_SECONDS" \
+    memory_guard_max_rss_mb="$MEMORY_GUARD_MAX_RSS_MB" \
+    memory_guard_min_system_available_mb="$MEMORY_GUARD_MIN_SYSTEM_AVAILABLE_MB" \
+    memory_guard_min_cgroup_available_mb="$MEMORY_GUARD_MIN_CGROUP_AVAILABLE_MB" \
+    memory_guard_max_cgroup_used_fraction="$MEMORY_GUARD_MAX_CGROUP_USED_FRACTION" \
+    memory_guard_graceful_exit="$MEMORY_GUARD_GRACEFUL_EXIT" \
+    memory_guard_exit_code="$MEMORY_GUARD_EXIT_CODE" \
+    memory_guard_train_partial_batch="$MEMORY_GUARD_TRAIN_PARTIAL_BATCH" \
     log_path="$run_dir" \
     wandb_project=synthetic-fs-rl \
     wandb_name="$run_name" \
-    behavior_if_log_dir_exists=raise \
+    behavior_if_log_dir_exists="$LOGDIR_BEHAVIOR" \
     "${EXTRA_ARGS[@]}" \
     2>&1 | tee -a "$shell_log"
+    py_status=${PIPESTATUS[0]}
+    set -e
+
+    if ! is_autorestart_exit_code "$py_status"; then
+      return "$py_status"
+    fi
+    if [ "$memory_guard_attempt" -ge "$MEMORY_GUARD_RESTARTS" ]; then
+      echo "Training exited with retriable status $py_status, but MEMORY_GUARD_RESTARTS=$MEMORY_GUARD_RESTARTS is exhausted." >&2
+      return "$py_status"
+    fi
+
+    memory_guard_attempt=$((memory_guard_attempt + 1))
+    if [ "$MEMORY_GUARD_REDUCE_CONCURRENCY_ON_RESTART" = "true" ]; then
+      if [ "$current_ram_spool_max_concurrent" -eq 0 ]; then
+        current_ram_spool_max_concurrent=1
+      elif [ "$current_ram_spool_max_concurrent" -gt 1 ]; then
+        current_ram_spool_max_concurrent=$(((current_ram_spool_max_concurrent + 1) / 2))
+        if [ "$current_ram_spool_max_concurrent" -lt 1 ]; then
+          current_ram_spool_max_concurrent=1
+        fi
+      fi
+    fi
+    echo "Training exited with retriable status $py_status; resuming after ${MEMORY_GUARD_RESTART_SLEEP_SECONDS}s with RAM_SPOOL_MAX_CONCURRENT_GROUPS=$current_ram_spool_max_concurrent"
+    sleep "$MEMORY_GUARD_RESTART_SLEEP_SECONDS"
+  done
 }
 
 echo "SWEEP_ID=$SWEEP_ID"
@@ -323,6 +451,18 @@ echo "ANSWERER_MAX_TURNS=${ANSWERER_MAX_TURNS:-follow_max_turns}"
 echo "MODEL_NAME=$MODEL_NAME"
 echo "RAM_SPOOL_MINIBATCH_GROUPS=$RAM_SPOOL_MINIBATCH_GROUPS"
 echo "RAM_SPOOL_MAX_CONCURRENT_GROUPS=$RAM_SPOOL_MAX_CONCURRENT_GROUPS"
+echo "TERMINAL_ANSWERER_REPEATS=$TERMINAL_ANSWERER_REPEATS"
+echo "ANSWERABILITY_PROBE_REPEATS=$ANSWERABILITY_PROBE_REPEATS"
+echo "ANSWERABILITY_PROBE_MAX_PER_EPISODE=$ANSWERABILITY_PROBE_MAX_PER_EPISODE"
+echo "ANSWERER_REPEAT_CONCURRENCY=$ANSWERER_REPEAT_CONCURRENCY"
+echo "BUILDER_COMPACTION_TRIGGER_TOKENS=$BUILDER_COMPACTION_TRIGGER_TOKENS"
+echo "BUILDER_EXECUTOR_MAX_OUTPUT_TOKENS=$BUILDER_EXECUTOR_MAX_OUTPUT_TOKENS"
+echo "MEMORY_GUARD_ENABLED=$MEMORY_GUARD_ENABLED"
+echo "MEMORY_GUARD_MAX_CGROUP_USED_FRACTION=$MEMORY_GUARD_MAX_CGROUP_USED_FRACTION"
+echo "MEMORY_GUARD_EXIT_CODE=$MEMORY_GUARD_EXIT_CODE"
+echo "MEMORY_GUARD_RESTARTS=$MEMORY_GUARD_RESTARTS"
+echo "AUTORESTART_EXIT_CODES=$AUTORESTART_EXIT_CODES"
+echo "LOGDIR_BEHAVIOR=$LOGDIR_BEHAVIOR"
 echo "DATA_ROOT=$DATA_ROOT"
 echo "AGENT_DIR=$AGENT_DIR"
 echo "PRIVILEGED_DIR=$PRIVILEGED_DIR"

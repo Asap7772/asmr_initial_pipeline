@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import difflib
-import errno
 import gc
 import json
 import logging
@@ -29,6 +28,7 @@ from tinker_cookbook.rl.types import Env, EnvGroupBuilder, RLDataset, RLDatasetB
 from tinker_cookbook.tool_use import simple_tool_result, tool
 from tinker_cookbook.tool_use.tools import handle_tool_call
 from tinker_cookbook.tool_use.types import Tool, ToolResult
+from tinker_cookbook.utils import trace
 
 NodeKind = Literal["cluster", "merge_summary"]
 JudgeBackend = Literal["openrouter", "gemini", "vllm"]
@@ -36,6 +36,7 @@ AnswererWorkspaceMode = Literal["synthetic_only"]
 READ_FILE_MAX_LINES = 100
 READ_FILE_MAX_CHARS = 12000
 READ_MANY_MAX_FILES = 4
+SYNTHETIC_PATH_SLUG_MAX_BYTES = 64
 ANSWER_PREFIX = "Answer:"
 STOP_MESSAGE = "STOP"
 MODEL_HTTP_TIMEOUT_SECONDS = 300
@@ -518,7 +519,20 @@ class SyntheticFilesystemState:
         slug = "".join(chars).strip("_")
         while "__" in slug:
             slug = slug.replace("__", "_")
-        return slug or "untitled"
+        return self._truncate_path_slug(slug or "untitled")
+
+    def _truncate_path_slug(self, slug: str) -> str:
+        if len(slug.encode("utf-8")) <= SYNTHETIC_PATH_SLUG_MAX_BYTES:
+            return slug
+        chars: list[str] = []
+        used_bytes = 0
+        for ch in slug:
+            ch_bytes = len(ch.encode("utf-8"))
+            if used_bytes + ch_bytes > SYNTHETIC_PATH_SLUG_MAX_BYTES:
+                break
+            chars.append(ch)
+            used_bytes += ch_bytes
+        return "".join(chars).rstrip("_") or "untitled"
 
     def _cluster_node_id(self) -> str:
         node_id = f"cluster_{self.next_cluster_idx:04d}"
@@ -542,10 +556,10 @@ class SyntheticFilesystemState:
         return sorted(records, key=self._record_sort_key)
 
     def _dir_name(self, rec: SyntheticFileRecord) -> str:
-        return f"{rec.node_id}__{rec.slug}"
+        return f"{rec.node_id}__{self._truncate_path_slug(rec.slug)}"
 
     def _file_name(self, rec: SyntheticFileRecord) -> str:
-        return f"{rec.node_id}__{rec.slug}.txt"
+        return f"{rec.node_id}__{self._truncate_path_slug(rec.slug)}.txt"
 
     def _active_path_parts(self, node_id: str) -> list[str]:
         rec = self.files_by_id[node_id]
@@ -1347,95 +1361,6 @@ class ReadOnlyAnswererWorkspaceTools:
         )
 
 
-class InMemoryAnswererWorkspaceTools:
-    def __init__(self, files: dict[str, str]):
-        self.files = {self._clean_path(path): text for path, text in files.items()}
-        self.dirs = self._build_dirs(self.files)
-
-    def _clean_path(self, path: str) -> str:
-        clean = str(path).strip() or "."
-        clean = clean.strip("\"'`")
-        clean = clean.replace("\\", "/")
-        while clean.startswith("./"):
-            clean = clean[2:]
-        clean = clean.lstrip("/")
-        if clean in {"", "."}:
-            return "."
-        parts = PurePosixPath(clean).parts
-        if any(part == ".." for part in parts):
-            raise ValueError(f"Path escapes workspace root: {path}")
-        return str(PurePosixPath(*parts))
-
-    def _build_dirs(self, files: dict[str, str]) -> set[str]:
-        dirs = {"."}
-        for path in files:
-            parent = PurePosixPath(path).parent
-            while str(parent) not in {"", "."}:
-                dirs.add(str(parent))
-                parent = parent.parent
-        return dirs
-
-    def list_files(self, path: str = ".") -> dict[str, Any]:
-        clean = self._clean_path(path)
-        if clean in self.files:
-            return {
-                "path": clean,
-                "type": "file",
-                "entries": [],
-            }
-        if clean not in self.dirs:
-            raise ValueError(f"Path not found: {path}")
-
-        entries_by_path: dict[str, str] = {}
-        prefix = "" if clean == "." else f"{clean}/"
-        for file_path in self.files:
-            if prefix and not file_path.startswith(prefix):
-                continue
-            remainder = file_path[len(prefix) :]
-            if not remainder:
-                continue
-            child_name = remainder.split("/", 1)[0]
-            child_path = child_name if clean == "." else str(PurePosixPath(clean) / child_name)
-            child_type = "file" if "/" not in remainder else "dir"
-            prev = entries_by_path.get(child_path)
-            if prev == "dir":
-                continue
-            if prev == "file" and child_type == "dir":
-                entries_by_path[child_path] = "dir"
-                continue
-            entries_by_path.setdefault(child_path, child_type)
-
-        entries = [
-            {"path": child_path, "type": child_type}
-            for child_path, child_type in sorted(
-                entries_by_path.items(), key=lambda item: (item[1] == "file", item[0].lower())
-            )
-        ]
-        return {
-            "path": clean,
-            "type": "dir",
-            "entries": entries,
-        }
-
-    def read_file(self, path: str, start_line: int = 1, num_lines: int = READ_FILE_MAX_LINES) -> dict[str, Any]:
-        clean = self._clean_path(path)
-        if clean not in self.files:
-            if clean in self.dirs:
-                raise ValueError(f"Path is not a file: {path}")
-            raise ValueError(f"Path not found: {path}")
-        if start_line < 1:
-            raise ValueError(f"start_line must be >= 1, got {start_line}")
-        if num_lines < 1:
-            raise ValueError(f"num_lines must be >= 1, got {num_lines}")
-        num_lines = min(num_lines, READ_FILE_MAX_LINES)
-        return _read_text_line_window(
-            path=clean,
-            text=self.files[clean],
-            start_line=start_line,
-            num_lines=num_lines,
-        )
-
-
 @dataclass(frozen=True)
 class FrozenSyntheticFileExecutor:
     """External frozen-model executor that writes synthetic files from planner-selected sources."""
@@ -1557,6 +1482,40 @@ class BuilderFilesystemTools:
     def __init__(self, state: SyntheticFilesystemState, executor: FrozenSyntheticFileExecutor | None = None):
         self.state = state
         self.executor = executor
+
+    async def _generate_cluster_text_with_executor(
+        self,
+        *,
+        title: str,
+        input_paths: Sequence[str],
+        generation_instructions: str,
+    ) -> str:
+        assert self.executor is not None
+        async with trace.scope_span("remote/builder_executor_cluster_call"):
+            return await asyncio.to_thread(
+                self.executor.generate_cluster_text,
+                state=self.state,
+                title=title,
+                input_paths=input_paths,
+                generation_instructions=generation_instructions,
+            )
+
+    async def _generate_merge_summary_text_with_executor(
+        self,
+        *,
+        title: str,
+        child_paths: Sequence[str],
+        generation_instructions: str,
+    ) -> str:
+        assert self.executor is not None
+        async with trace.scope_span("remote/builder_executor_merge_call"):
+            return await asyncio.to_thread(
+                self.executor.generate_merge_summary_text,
+                state=self.state,
+                title=title,
+                child_paths=child_paths,
+                generation_instructions=generation_instructions,
+            )
 
     def _error_code(self, tool_name: str, exc: Exception, *, directory_listing: dict[str, Any] | None = None) -> str:
         if directory_listing is not None:
@@ -1728,9 +1687,7 @@ class BuilderFilesystemTools:
     ) -> ToolResult:
         try:
             if self.executor is not None:
-                cluster_text = await asyncio.to_thread(
-                    self.executor.generate_cluster_text,
-                    state=self.state,
+                cluster_text = await self._generate_cluster_text_with_executor(
                     title=title,
                     input_paths=input_paths,
                     generation_instructions=generation_instructions,
@@ -1768,9 +1725,7 @@ class BuilderFilesystemTools:
             cluster_text = str(spec.get("cluster_text", "") or "")
             try:
                 if self.executor is not None:
-                    cluster_text = await asyncio.to_thread(
-                        self.executor.generate_cluster_text,
-                        state=self.state,
+                    cluster_text = await self._generate_cluster_text_with_executor(
                         title=title,
                         input_paths=input_paths,
                         generation_instructions=generation_instructions,
@@ -1817,9 +1772,7 @@ class BuilderFilesystemTools:
     ) -> ToolResult:
         try:
             if self.executor is not None:
-                merge_summary_text = await asyncio.to_thread(
-                    self.executor.generate_merge_summary_text,
-                    state=self.state,
+                merge_summary_text = await self._generate_merge_summary_text_with_executor(
                     title=title,
                     child_paths=child_paths,
                     generation_instructions=generation_instructions,
@@ -1858,9 +1811,7 @@ class BuilderFilesystemTools:
             merge_summary_text = str(spec.get("merge_summary_text", "") or "")
             try:
                 if self.executor is not None:
-                    merge_summary_text = await asyncio.to_thread(
-                        self.executor.generate_merge_summary_text,
-                        state=self.state,
+                    merge_summary_text = await self._generate_merge_summary_text_with_executor(
                         title=title,
                         child_paths=child_paths,
                         generation_instructions=generation_instructions,
@@ -1961,6 +1912,7 @@ class SyntheticFilesystemReward:
     answerability_delta_min_abs: float = 0.25
     answerability_delta_allow_negative: bool = True
     answerability_probe_repeats: int = 4
+    answerer_repeat_concurrency: int = 1
     judge_max_output_tokens: int = 64
     last_answerer_trace: dict[str, Any] = field(default_factory=dict, init=False)
 
@@ -2090,43 +2042,65 @@ class SyntheticFilesystemReward:
     ) -> tuple[dict[str, Any], dict[str, float], dict[str, float], int]:
         """Run the answerer one or more times and average score/usage metrics.
 
-        Repeats are sequential rather than parallel to avoid multiplying transient
-        memory pressure during rollout batches.
+        Repeats are independent reward samples. Run them with bounded concurrency
+        to keep the robust averaged reward while avoiding unnecessary serial
+        remote-call latency.
         """
         repeat_count = max(1, int(repeats))
-        scored: list[tuple[dict[str, Any], dict[str, float], dict[str, float]]] = []
-        for repeat_idx in range(repeat_count):
-            try:
-                answerer_result = await self._run_answerer()
-                usage = self._answerer_usage_metrics(answerer_result)
-                score_metrics = await self._score_answerer_output(
-                    answerer_output=str(answerer_result.get("answer_text", "")),
-                    synthetic_read_count=usage["synthetic_read_count"],
-                    answerer_evaluated=1.0,
-                    terminal_step=1.0,
+        repeat_concurrency = max(1, min(int(self.answerer_repeat_concurrency), repeat_count))
+
+        async def run_one_repeat(
+            repeat_idx: int,
+        ) -> tuple[dict[str, Any], dict[str, float], dict[str, float]]:
+            async with trace.scope_span("answerer_repeat"):
+                try:
+                    answerer_result = await self._run_answerer()
+                    usage = self._answerer_usage_metrics(answerer_result)
+                    score_metrics = await self._score_answerer_output(
+                        answerer_output=str(answerer_result.get("answer_text", "")),
+                        synthetic_read_count=usage["synthetic_read_count"],
+                        answerer_evaluated=1.0,
+                        terminal_step=1.0,
+                    )
+                    score_metrics.setdefault("answerer_error", 0.0)
+                    score_metrics.setdefault("judge_error", 0.0)
+                except Exception:
+                    LOGGER.warning(
+                        "Answerer repeat %s/%s failed; scoring this repeat as incorrect.",
+                        repeat_idx + 1,
+                        repeat_count,
+                        exc_info=True,
+                    )
+                    answerer_result = self._empty_answerer_result()
+                    usage = self._answerer_usage_metrics(answerer_result)
+                    score_metrics = {
+                        "correct": 0.0,
+                        "exact_match": 0.0,
+                        "judge_used": 0.0,
+                        "judge_score": 0.0,
+                        "judge_error": 0.0,
+                        "answerer_error": 1.0,
+                        "judge_skipped_no_candidate": 0.0,
+                        "judge_skipped_no_synthetic_reads": 0.0,
+                    }
+            return answerer_result, usage, score_metrics
+
+        if repeat_concurrency <= 1:
+            scored = [await run_one_repeat(repeat_idx) for repeat_idx in range(repeat_count)]
+        else:
+            semaphore = asyncio.Semaphore(repeat_concurrency)
+
+            async def run_bounded_repeat(
+                repeat_idx: int,
+            ) -> tuple[dict[str, Any], dict[str, float], dict[str, float]]:
+                async with semaphore:
+                    return await run_one_repeat(repeat_idx)
+
+            scored = list(
+                await asyncio.gather(
+                    *(run_bounded_repeat(repeat_idx) for repeat_idx in range(repeat_count))
                 )
-                score_metrics.setdefault("answerer_error", 0.0)
-                score_metrics.setdefault("judge_error", 0.0)
-            except Exception:
-                LOGGER.warning(
-                    "Answerer repeat %s/%s failed; scoring this repeat as incorrect.",
-                    repeat_idx + 1,
-                    repeat_count,
-                    exc_info=True,
-                )
-                answerer_result = self._empty_answerer_result()
-                usage = self._answerer_usage_metrics(answerer_result)
-                score_metrics = {
-                    "correct": 0.0,
-                    "exact_match": 0.0,
-                    "judge_used": 0.0,
-                    "judge_score": 0.0,
-                    "judge_error": 0.0,
-                    "answerer_error": 1.0,
-                    "judge_skipped_no_candidate": 0.0,
-                    "judge_skipped_no_synthetic_reads": 0.0,
-                }
-            scored.append((answerer_result, usage, score_metrics))
+            )
 
         primary_result = dict(
             next(
@@ -2222,6 +2196,9 @@ class SyntheticFilesystemReward:
             "answerability_probe_min_abs_delta": self.answerability_delta_min_abs,
             "answerability_probe_reward": reward,
             "answerability_probe_repeats": float(repeat_count),
+            "answerability_probe_repeat_concurrency": float(
+                max(1, min(int(self.answerer_repeat_concurrency), int(repeat_count)))
+            ),
             "answerability_probe_retrieval_cost_penalty": retrieval_penalty,
             "answerability_probe_synthetic_read_cost_penalty": synthetic_read_penalty,
             "answerability_probe_synthetic_read_count": usage["synthetic_read_count"],
@@ -2421,6 +2398,11 @@ class SyntheticFilesystemReward:
             **maturity,
         )
         metrics["answerer_repeats"] = float(answerer_repeats_used)
+        metrics["answerer_repeat_concurrency"] = (
+            float(max(1, min(int(self.answerer_repeat_concurrency), int(answerer_repeats_used))))
+            if answerer_repeats_used > 0
+            else 0.0
+        )
         metrics["answerer_error_rate"] = answerer_error_rate
         metrics["judge_error_rate"] = judge_error_rate
         if terminal_step >= 1.0 and answerer_evaluated >= 1.0:
@@ -2653,14 +2635,6 @@ class SyntheticFilesystemReward:
     def _check_answer(self, model_answer: str) -> bool:
         return normalize_answer(model_answer) == normalize_answer(self.gold_answer)
 
-    def _answerer_workspace_files(self) -> dict[str, str]:
-        files = {"README.md": self.state.generate_readme()}
-        for rec in self.state.active_records():
-            files[self.state.workspace_relative_path(rec.node_id)] = (
-                self.state.render_final_workspace_file(rec)
-            )
-        return files
-
     async def _llm_judge_score(self, model_answer: str) -> float:
         prompt = (
             "You are judging whether a predicted answer should count as correct for a question. "
@@ -2671,16 +2645,17 @@ class SyntheticFilesystemReward:
             "Count semantically equivalent answers as correct even if formatting differs. "
             "Be strict about factual mismatch."
         )
-        response_text = await asyncio.to_thread(
-            self._call_chat_model,
-            backend=self.judge_backend,
-            model=self.judge_model,
-            base_url=self.judge_base_url,
-            api_key_env=self.judge_api_key_env,
-            prompt=prompt,
-            response_json=True,
-            max_output_tokens=self.judge_max_output_tokens,
-        )
+        async with trace.scope_span("remote/judge_model_call"):
+            response_text = await asyncio.to_thread(
+                self._call_chat_model,
+                backend=self.judge_backend,
+                model=self.judge_model,
+                base_url=self.judge_base_url,
+                api_key_env=self.judge_api_key_env,
+                prompt=prompt,
+                response_json=True,
+                max_output_tokens=self.judge_max_output_tokens,
+            )
         try:
             parsed = json.loads(response_text)
             val = float(parsed.get("correct", 0))
@@ -2691,23 +2666,12 @@ class SyntheticFilesystemReward:
     async def _run_answerer(self) -> dict[str, Any]:
         with tempfile.TemporaryDirectory(prefix="synthetic_fs_answerer_") as tmpdir:
             root_bootstrap_entries = self.state.answerer_bootstrap_entries()
-            try:
-                workspace_root = self.state.materialize_final_workspace(
-                    Path(tmpdir) / "final_workspace",
-                    mode=self.answerer_workspace_mode,
-                )
-                tools = ReadOnlyAnswererWorkspaceTools(workspace_root)
-                readme_text = (workspace_root / "README.md").read_text(encoding="utf-8").strip()
-            except OSError as exc:
-                if exc.errno != errno.ENAMETOOLONG:
-                    raise
-                LOGGER.warning(
-                    "Falling back to in-memory answerer workspace after "
-                    "path materialization hit ENAMETOOLONG"
-                )
-                workspace_files = self._answerer_workspace_files()
-                tools = InMemoryAnswererWorkspaceTools(workspace_files)
-                readme_text = workspace_files["README.md"].strip()
+            workspace_root = self.state.materialize_final_workspace(
+                Path(tmpdir) / "final_workspace",
+                mode=self.answerer_workspace_mode,
+            )
+            tools = ReadOnlyAnswererWorkspaceTools(workspace_root)
+            readme_text = (workspace_root / "README.md").read_text(encoding="utf-8").strip()
 
             bootstrap_blocks = [
                 "[README.md]",
@@ -2775,15 +2739,16 @@ class SyntheticFilesystemReward:
                 return tools.list_files(path=clean)
 
             for step in range(1, self.answerer_max_turns + 1):
-                response_text = await asyncio.to_thread(
-                    self._call_chat_model_messages,
-                    backend=self.answerer_backend,
-                    model=self.answerer_model,
-                    base_url=self.answerer_base_url,
-                    api_key_env=self.answerer_api_key_env,
-                    messages=messages,
-                    response_json=False,
-                )
+                async with trace.scope_span("remote/answerer_model_call"):
+                    response_text = await asyncio.to_thread(
+                        self._call_chat_model_messages,
+                        backend=self.answerer_backend,
+                        model=self.answerer_model,
+                        base_url=self.answerer_base_url,
+                        api_key_env=self.answerer_api_key_env,
+                        messages=messages,
+                        response_json=False,
+                    )
                 response_text = response_text.strip()
                 messages.append({"role": "assistant", "content": response_text})
 
@@ -2847,15 +2812,16 @@ class SyntheticFilesystemReward:
                     ),
                 }
             )
-            response_text = await asyncio.to_thread(
-                self._call_chat_model_messages,
-                backend=self.answerer_backend,
-                model=self.answerer_model,
-                base_url=self.answerer_base_url,
-                api_key_env=self.answerer_api_key_env,
-                messages=messages,
-                response_json=False,
-            )
+            async with trace.scope_span("remote/answerer_model_call"):
+                response_text = await asyncio.to_thread(
+                    self._call_chat_model_messages,
+                    backend=self.answerer_backend,
+                    model=self.answerer_model,
+                    base_url=self.answerer_base_url,
+                    api_key_env=self.answerer_api_key_env,
+                    messages=messages,
+                    response_json=False,
+                )
             response_text = self._truncate_final_answer(response_text.strip())
             if not response_text:
                 response_text = f"{ANSWER_PREFIX} Unknown"
@@ -3729,19 +3695,20 @@ class RedactingAgentToolMessageEnv(MessageEnv):
             f"### LATEST BUILDER TRANSCRIPT TO INCORPORATE\n{latest_transcript}\n\n"
             "Return only the updated summary. Do not include preamble."
         )
-        response = await asyncio.to_thread(
-            call_chat_model_messages,
-            backend=self.compaction_backend,
-            model=self.compaction_model,
-            base_url=self.compaction_base_url,
-            api_key_env=self.compaction_api_key_env,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            response_json=False,
-            max_output_tokens=self.compaction_max_output_tokens,
-        )
+        async with trace.scope_span("remote/builder_compaction_call"):
+            response = await asyncio.to_thread(
+                call_chat_model_messages,
+                backend=self.compaction_backend,
+                model=self.compaction_model,
+                base_url=self.compaction_base_url,
+                api_key_env=self.compaction_api_key_env,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                response_json=False,
+                max_output_tokens=self.compaction_max_output_tokens,
+            )
         return response.strip()
 
     def _filesystem_snapshot(self) -> str:
@@ -3980,6 +3947,7 @@ class SyntheticFilesystemEnvGroupBuilder(EnvGroupBuilder):
     answerability_probe_interval_turns: int = 8
     answerability_probe_min_maturity: float = 0.45
     answerability_probe_repeats: int = 4
+    answerer_repeat_concurrency: int = 1
     judge_max_output_tokens: int = 64
     log_step_details: bool = False
     log_compaction_summaries: bool = False
@@ -4107,6 +4075,7 @@ class SyntheticFilesystemEnvGroupBuilder(EnvGroupBuilder):
                 answerability_delta_min_abs=self.answerability_delta_min_abs,
                 answerability_delta_allow_negative=self.answerability_delta_allow_negative,
                 answerability_probe_repeats=self.answerability_probe_repeats,
+                answerer_repeat_concurrency=self.answerer_repeat_concurrency,
                 judge_max_output_tokens=self.judge_max_output_tokens,
             )
             envs.append(
@@ -4282,6 +4251,7 @@ class SyntheticFilesystemDatasetBuilder(RLDatasetBuilder):
     answerability_probe_interval_turns: int = 8
     answerability_probe_min_maturity: float = 0.45
     answerability_probe_repeats: int = 4
+    answerer_repeat_concurrency: int = 1
     judge_max_output_tokens: int = 64
     log_step_details: bool = False
     log_compaction_summaries: bool = False
@@ -4406,6 +4376,7 @@ class SyntheticFilesystemDatasetBuilder(RLDatasetBuilder):
                 answerability_probe_interval_turns=self.answerability_probe_interval_turns,
                 answerability_probe_min_maturity=self.answerability_probe_min_maturity,
                 answerability_probe_repeats=self.answerability_probe_repeats,
+                answerer_repeat_concurrency=self.answerer_repeat_concurrency,
                 judge_max_output_tokens=self.judge_max_output_tokens,
                 log_step_details=self.log_step_details,
                 log_compaction_summaries=self.log_compaction_summaries,
@@ -4500,6 +4471,7 @@ class SyntheticFilesystemDatasetBuilder(RLDatasetBuilder):
                 answerability_probe_interval_turns=self.answerability_probe_interval_turns,
                 answerability_probe_min_maturity=self.answerability_probe_min_maturity,
                 answerability_probe_repeats=self.answerability_probe_repeats,
+                answerer_repeat_concurrency=self.answerer_repeat_concurrency,
                 judge_max_output_tokens=self.judge_max_output_tokens,
                 log_step_details=self.log_step_details,
                 log_compaction_summaries=self.log_compaction_summaries,

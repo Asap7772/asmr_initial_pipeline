@@ -8,6 +8,7 @@ import os
 import pickle
 import shutil
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,13 @@ from tinker_cookbook.rl import train
 from tinker_cookbook.utils.misc_utils import safezip
 
 logger = logging.getLogger(__name__)
+
+
+class _MemoryGuardGracefulExit(Exception):
+    def __init__(self, *, exit_code: int, reason: str):
+        super().__init__(reason)
+        self.exit_code = exit_code
+        self.reason = reason
 
 
 def _known_model_context_window_tokens(model_name: str) -> int | None:
@@ -509,6 +517,189 @@ def _current_rss_mb() -> float | None:
     return None
 
 
+@dataclass(frozen=True)
+class _MemorySnapshot:
+    rss_mb: float | None
+    system_available_mb: float | None
+    cgroup_current_mb: float | None
+    cgroup_limit_mb: float | None
+    cgroup_available_mb: float | None
+
+
+@dataclass(frozen=True)
+class _MemoryGuardStatus:
+    triggered: bool
+    reason: str
+    snapshot: _MemorySnapshot
+
+
+_CGROUP_MEMORY_PATHS: list[Path] | None = None
+
+
+def _read_int_file(path: Path) -> int | None:
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not text or text == "max":
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _current_cgroup_memory_paths() -> list[Path]:
+    global _CGROUP_MEMORY_PATHS
+    if _CGROUP_MEMORY_PATHS is not None:
+        return _CGROUP_MEMORY_PATHS
+
+    paths: list[Path] = []
+    base = Path("/sys/fs/cgroup")
+    try:
+        lines = Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        _CGROUP_MEMORY_PATHS = []
+        return _CGROUP_MEMORY_PATHS
+
+    for line in lines:
+        parts = line.strip().split(":")
+        if len(parts) != 3:
+            continue
+        hierarchy, controllers, rel_path = parts
+        rel = rel_path.lstrip("/")
+        if hierarchy == "0":
+            path = base / rel
+        elif "memory" in controllers.split(","):
+            path = base / "memory" / rel
+        else:
+            continue
+
+        while True:
+            if path.exists():
+                paths.append(path)
+            if path == base or path.parent == path:
+                break
+            path = path.parent
+
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for path in paths:
+        if path not in seen:
+            deduped.append(path)
+            seen.add(path)
+    _CGROUP_MEMORY_PATHS = deduped
+    return _CGROUP_MEMORY_PATHS
+
+
+def _system_available_mb() -> float | None:
+    try:
+        with Path("/proc/meminfo").open(encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return float(parts[1]) / 1024.0
+    except OSError:
+        return None
+    return None
+
+
+def _cgroup_memory_snapshot_mb() -> tuple[float | None, float | None, float | None]:
+    best_current: float | None = None
+    best_limit: float | None = None
+    best_available: float | None = None
+    for path in _current_cgroup_memory_paths():
+        current_bytes = _read_int_file(path / "memory.current")
+        limit_bytes = _read_int_file(path / "memory.max")
+        if current_bytes is None or limit_bytes is None:
+            continue
+        available_bytes = max(0, limit_bytes - current_bytes)
+        if best_available is None or available_bytes < best_available:
+            best_current = float(current_bytes) / (1024.0 * 1024.0)
+            best_limit = float(limit_bytes) / (1024.0 * 1024.0)
+            best_available = float(available_bytes) / (1024.0 * 1024.0)
+    return best_current, best_limit, best_available
+
+
+def _memory_snapshot() -> _MemorySnapshot:
+    cgroup_current_mb, cgroup_limit_mb, cgroup_available_mb = _cgroup_memory_snapshot_mb()
+    return _MemorySnapshot(
+        rss_mb=_current_rss_mb(),
+        system_available_mb=_system_available_mb(),
+        cgroup_current_mb=cgroup_current_mb,
+        cgroup_limit_mb=cgroup_limit_mb,
+        cgroup_available_mb=cgroup_available_mb,
+    )
+
+
+def _memory_snapshot_metrics(prefix: str, snapshot: _MemorySnapshot) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    for name, value in (
+        ("rss_mb", snapshot.rss_mb),
+        ("system_available_mb", snapshot.system_available_mb),
+        ("cgroup_current_mb", snapshot.cgroup_current_mb),
+        ("cgroup_limit_mb", snapshot.cgroup_limit_mb),
+        ("cgroup_available_mb", snapshot.cgroup_available_mb),
+    ):
+        if value is not None:
+            metrics[f"{prefix}{name}"] = float(value)
+    return metrics
+
+
+def _check_memory_guard(
+    *,
+    enabled: bool,
+    max_rss_mb: float,
+    min_system_available_mb: float,
+    min_cgroup_available_mb: float,
+    max_cgroup_used_fraction: float,
+) -> _MemoryGuardStatus:
+    snapshot = _memory_snapshot()
+    if not enabled:
+        return _MemoryGuardStatus(triggered=False, reason="", snapshot=snapshot)
+
+    reasons: list[str] = []
+    if max_rss_mb > 0 and snapshot.rss_mb is not None and snapshot.rss_mb >= max_rss_mb:
+        reasons.append(f"rss_mb={snapshot.rss_mb:.1f} >= {max_rss_mb:.1f}")
+    if (
+        min_system_available_mb > 0
+        and snapshot.system_available_mb is not None
+        and snapshot.system_available_mb <= min_system_available_mb
+    ):
+        reasons.append(
+            "system_available_mb="
+            f"{snapshot.system_available_mb:.1f} <= {min_system_available_mb:.1f}"
+        )
+    if (
+        min_cgroup_available_mb > 0
+        and snapshot.cgroup_available_mb is not None
+        and snapshot.cgroup_available_mb <= min_cgroup_available_mb
+    ):
+        reasons.append(
+            "cgroup_available_mb="
+            f"{snapshot.cgroup_available_mb:.1f} <= {min_cgroup_available_mb:.1f}"
+        )
+    if (
+        0.0 < max_cgroup_used_fraction < 1.0
+        and snapshot.cgroup_current_mb is not None
+        and snapshot.cgroup_limit_mb is not None
+        and snapshot.cgroup_limit_mb > 0
+    ):
+        used_fraction = snapshot.cgroup_current_mb / snapshot.cgroup_limit_mb
+        if used_fraction >= max_cgroup_used_fraction:
+            reasons.append(
+                f"cgroup_used_fraction={used_fraction:.3f} >= "
+                f"{max_cgroup_used_fraction:.3f}"
+            )
+
+    return _MemoryGuardStatus(
+        triggered=bool(reasons),
+        reason="; ".join(reasons),
+        snapshot=snapshot,
+    )
+
+
 def _chunked(items: list[Path], chunk_size: int) -> list[list[Path]]:
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be positive, got {chunk_size}")
@@ -658,6 +849,15 @@ def _install_spooled_sync_training_patch(
     ram_spool_cleanup: bool,
     ppo_clip_low_threshold: float,
     ppo_clip_high_threshold: float,
+    memory_guard_enabled: bool,
+    memory_guard_poll_seconds: float,
+    memory_guard_max_rss_mb: float,
+    memory_guard_min_system_available_mb: float,
+    memory_guard_min_cgroup_available_mb: float,
+    memory_guard_max_cgroup_used_fraction: float,
+    memory_guard_graceful_exit: bool,
+    memory_guard_exit_code: int,
+    memory_guard_train_partial_batch: bool,
 ) -> None:
     if ram_spool_minibatch_groups <= 0:
         raise ValueError(
@@ -668,6 +868,12 @@ def _install_spooled_sync_training_patch(
             "ram_spool_max_concurrent_groups must be non-negative, got "
             f"{ram_spool_max_concurrent_groups}"
         )
+    if memory_guard_poll_seconds <= 0:
+        raise ValueError(
+            f"memory_guard_poll_seconds must be positive, got {memory_guard_poll_seconds}"
+        )
+    if not 1 <= memory_guard_exit_code <= 255:
+        raise ValueError(f"memory_guard_exit_code must be in [1, 255], got {memory_guard_exit_code}")
 
     spool_root = Path(ram_spool_dir).expanduser().resolve()
     spool_root.mkdir(parents=True, exist_ok=True)
@@ -713,6 +919,8 @@ def _install_spooled_sync_training_patch(
                 "ram_spool/enabled": 1.0,
                 "ram_spool/minibatch_groups": float(ram_spool_minibatch_groups),
             }
+            memory_guard_triggered = False
+            memory_guard_exit_reason = ""
             batch_dir = spool_root / f"batch_{i_batch:06d}"
             if batch_dir.exists():
                 shutil.rmtree(batch_dir)
@@ -809,69 +1017,221 @@ def _install_spooled_sync_training_patch(
                                     included_for_training=included_for_training,
                                 )
 
-                            semaphore = asyncio.Semaphore(max_concurrent_groups)
+                            sampling_peak_rss_mb = 0.0
+                            sampling_peak_cgroup_current_mb = 0.0
+                            sampling_min_cgroup_available_mb: float | None = None
+                            memory_guard_trigger_status: _MemoryGuardStatus | None = None
 
-                            async def run_one_group_bounded(
-                                group_idx: int, builder: Any
-                            ) -> _SpooledGroupRecord:
-                                async with semaphore:
-                                    return await run_one_group(group_idx, builder)
-
-                            tasks = [
-                                asyncio.create_task(
-                                    run_one_group_bounded(i, builder),
-                                    name=f"spooled_trajectory_group_worker_{i}",
-                                )
-                                for i, builder in enumerate(env_group_builders_P)
-                            ]
-                            pbar = train.tqdm(
-                                total=len(tasks), desc=f"Sampling batch {i_batch}"
-                            )
-                            try:
-                                for completed in asyncio.as_completed(tasks):
-                                    record = await completed
-                                    pbar.update(1)
-                                    if record.path is None:
-                                        continue
-                                    total_spool_bytes += record.spool_bytes
-                                    spooled_files.append(record.path)
-                                    if first_success_file is None:
-                                        first_success_file = record.path
-                                    if record.included_for_training:
-                                        training_files.append(record.path)
-                                    sampling_metric_records.append(
-                                        _SamplingMetricRecord(
-                                            sampling_client_step=i_batch,
-                                            metrics=record.worker_metrics,
+                            def update_sampling_memory_metrics(
+                                snapshot: _MemorySnapshot,
+                            ) -> None:
+                                nonlocal sampling_peak_rss_mb
+                                nonlocal sampling_peak_cgroup_current_mb
+                                nonlocal sampling_min_cgroup_available_mb
+                                if snapshot.rss_mb is not None:
+                                    sampling_peak_rss_mb = max(
+                                        sampling_peak_rss_mb, snapshot.rss_mb
+                                    )
+                                if snapshot.cgroup_current_mb is not None:
+                                    sampling_peak_cgroup_current_mb = max(
+                                        sampling_peak_cgroup_current_mb,
+                                        snapshot.cgroup_current_mb,
+                                    )
+                                if snapshot.cgroup_available_mb is not None:
+                                    sampling_min_cgroup_available_mb = (
+                                        snapshot.cgroup_available_mb
+                                        if sampling_min_cgroup_available_mb is None
+                                        else min(
+                                            sampling_min_cgroup_available_mb,
+                                            snapshot.cgroup_available_mb,
                                         )
                                     )
-                                    gc.collect()
+
+                            def check_sampling_memory_guard() -> _MemoryGuardStatus:
+                                status = _check_memory_guard(
+                                    enabled=memory_guard_enabled,
+                                    max_rss_mb=memory_guard_max_rss_mb,
+                                    min_system_available_mb=memory_guard_min_system_available_mb,
+                                    min_cgroup_available_mb=memory_guard_min_cgroup_available_mb,
+                                    max_cgroup_used_fraction=(
+                                        memory_guard_max_cgroup_used_fraction
+                                    ),
+                                )
+                                update_sampling_memory_metrics(status.snapshot)
+                                return status
+
+                            active_tasks: dict[asyncio.Task[_SpooledGroupRecord], int] = {}
+                            next_group_idx = 0
+                            total_groups = len(env_group_builders_P)
+                            pbar = train.tqdm(
+                                total=total_groups, desc=f"Sampling batch {i_batch}"
+                            )
+
+                            def launch_available_groups() -> None:
+                                nonlocal next_group_idx
+                                nonlocal memory_guard_trigger_status
+                                while (
+                                    next_group_idx < total_groups
+                                    and len(active_tasks) < max_concurrent_groups
+                                ):
+                                    status = check_sampling_memory_guard()
+                                    if status.triggered:
+                                        memory_guard_trigger_status = status
+                                        logger.warning(
+                                            "Memory guard stopping new rollouts in batch %s: %s",
+                                            i_batch,
+                                            status.reason,
+                                        )
+                                        return
+                                    group_idx = next_group_idx
+                                    builder = env_group_builders_P[group_idx]
+                                    task = asyncio.create_task(
+                                        run_one_group(group_idx, builder),
+                                        name=f"spooled_trajectory_group_worker_{group_idx}",
+                                    )
+                                    active_tasks[task] = group_idx
+                                    next_group_idx += 1
+
+                            try:
+                                launch_available_groups()
+                                while active_tasks:
+                                    done, _ = await asyncio.wait(
+                                        active_tasks,
+                                        timeout=memory_guard_poll_seconds,
+                                        return_when=asyncio.FIRST_COMPLETED,
+                                    )
+                                    if not done:
+                                        status = check_sampling_memory_guard()
+                                        if status.triggered:
+                                            memory_guard_trigger_status = status
+                                            logger.warning(
+                                                "Memory guard cancelling %d active rollouts "
+                                                "in batch %s: %s",
+                                                len(active_tasks),
+                                                i_batch,
+                                                status.reason,
+                                            )
+                                            for task in active_tasks:
+                                                task.cancel()
+                                            await asyncio.gather(
+                                                *active_tasks, return_exceptions=True
+                                            )
+                                            active_tasks.clear()
+                                            break
+                                        continue
+
+                                    for task in done:
+                                        active_tasks.pop(task, None)
+                                        record = await task
+                                        pbar.update(1)
+                                        if record.path is None:
+                                            continue
+                                        total_spool_bytes += record.spool_bytes
+                                        spooled_files.append(record.path)
+                                        if first_success_file is None:
+                                            first_success_file = record.path
+                                        if record.included_for_training:
+                                            training_files.append(record.path)
+                                        sampling_metric_records.append(
+                                            _SamplingMetricRecord(
+                                                sampling_client_step=i_batch,
+                                                metrics=record.worker_metrics,
+                                            )
+                                        )
+                                        gc.collect()
+
+                                    if memory_guard_trigger_status is None:
+                                        launch_available_groups()
+                                    if memory_guard_trigger_status is not None:
+                                        for task in active_tasks:
+                                            task.cancel()
+                                        await asyncio.gather(
+                                            *active_tasks, return_exceptions=True
+                                        )
+                                        active_tasks.clear()
+                                        break
                             except Exception:
-                                for task in tasks:
+                                for task in active_tasks:
                                     task.cancel()
-                                await asyncio.gather(*tasks, return_exceptions=True)
+                                await asyncio.gather(*active_tasks, return_exceptions=True)
                                 raise
                             finally:
                                 pbar.close()
+                                if sampling_peak_rss_mb > 0:
+                                    metrics["memory_guard/rss_mb_peak_sampling"] = (
+                                        sampling_peak_rss_mb
+                                    )
+                                if sampling_peak_cgroup_current_mb > 0:
+                                    metrics[
+                                        "memory_guard/cgroup_current_mb_peak_sampling"
+                                    ] = sampling_peak_cgroup_current_mb
+                                if sampling_min_cgroup_available_mb is not None:
+                                    metrics[
+                                        "memory_guard/cgroup_available_mb_min_sampling"
+                                    ] = sampling_min_cgroup_available_mb
+
+                    memory_guard_triggered = memory_guard_trigger_status is not None
+                    if memory_guard_triggered:
+                        assert memory_guard_trigger_status is not None
+                        memory_guard_exit_reason = memory_guard_trigger_status.reason
+                        metrics["memory_guard/triggered"] = 1.0
+                        metrics["memory_guard/completed_groups_before_trigger"] = float(
+                            len(spooled_files)
+                        )
+                        metrics["memory_guard/pending_groups_after_trigger"] = float(
+                            len(env_group_builders_P) - len(spooled_files)
+                        )
+                        metrics["memory_guard/graceful_exit"] = float(
+                            memory_guard_graceful_exit
+                        )
+                        metrics["memory_guard/train_partial_batch"] = float(
+                            memory_guard_train_partial_batch
+                        )
+                        metrics.update(
+                            _memory_snapshot_metrics(
+                                "memory_guard/trigger_",
+                                memory_guard_trigger_status.snapshot,
+                            )
+                        )
+                    else:
+                        metrics["memory_guard/triggered"] = 0.0
 
                     if (
                         config.remove_constant_reward_groups
                         and not training_files
                         and first_success_file is not None
+                        and (not memory_guard_triggered or memory_guard_train_partial_batch)
                     ):
                         training_files = [first_success_file]
                         payload = _load_group_payload(first_success_file)
                         trajectory_metrics.add(payload["tags"], payload["trajectory_group"])
                         del payload
 
+                    if memory_guard_triggered and not memory_guard_train_partial_batch:
+                        training_files = []
+
                     batch_skipped = not training_files
                     metrics["ram_spool/spooled_groups"] = float(len(spooled_files))
                     metrics["ram_spool/training_groups"] = float(len(training_files))
                     metrics["ram_spool/spool_bytes_mb"] = total_spool_bytes / (1024.0 * 1024.0)
-                    if rss_mb := _current_rss_mb():
-                        metrics["ram_spool/rss_mb_after_sampling"] = rss_mb
+                    sampling_memory_snapshot = _memory_snapshot()
+                    metrics.update(
+                        _memory_snapshot_metrics("ram_spool/after_sampling_", sampling_memory_snapshot)
+                    )
+                    if sampling_memory_snapshot.rss_mb is not None:
+                        metrics["ram_spool/rss_mb_after_sampling"] = (
+                            sampling_memory_snapshot.rss_mb
+                        )
 
-                    if batch_skipped:
+                    if memory_guard_triggered and not memory_guard_train_partial_batch:
+                        assert memory_guard_trigger_status is not None
+                        logger.warning(
+                            "Batch %s: memory guard triggered before training; "
+                            "skipping this partial batch. Reason: %s",
+                            i_batch,
+                            memory_guard_trigger_status.reason,
+                        )
+                    elif batch_skipped:
                         logger.warning(
                             "Batch %s: all groups failed or filtered, skipping batch", i_batch
                         )
@@ -903,8 +1263,12 @@ def _install_spooled_sync_training_patch(
                 metrics.update(window.get_timing_metrics())
                 if error_counter is not None:
                     metrics.update(error_counter.get_metrics())
-                if rss_mb := _current_rss_mb():
-                    metrics["ram_spool/rss_mb_after_batch"] = rss_mb
+                batch_memory_snapshot = _memory_snapshot()
+                metrics.update(
+                    _memory_snapshot_metrics("ram_spool/after_batch_", batch_memory_snapshot)
+                )
+                if batch_memory_snapshot.rss_mb is not None:
+                    metrics["ram_spool/rss_mb_after_batch"] = batch_memory_snapshot.rss_mb
                 window.save_timing(i_batch, store=ml_logger.store)
                 if (
                     config.span_chart_every > 0
@@ -916,6 +1280,11 @@ def _install_spooled_sync_training_patch(
                         window, i_batch, iter_dir / "timing_gantt.html"
                     )
                 ml_logger.log_metrics(metrics, step=i_batch)
+                if memory_guard_triggered and memory_guard_graceful_exit:
+                    raise _MemoryGuardGracefulExit(
+                        exit_code=memory_guard_exit_code,
+                        reason=memory_guard_exit_reason,
+                    )
             finally:
                 if ram_spool_cleanup and batch_dir.exists():
                     shutil.rmtree(batch_dir)
@@ -945,6 +1314,15 @@ class CLIConfig:
     ram_spool_minibatch_groups: int = 4
     ram_spool_max_concurrent_groups: int = 0
     ram_spool_cleanup: bool = True
+    memory_guard_enabled: bool = True
+    memory_guard_poll_seconds: float = 2.0
+    memory_guard_max_rss_mb: float = 0.0
+    memory_guard_min_system_available_mb: float = 0.0
+    memory_guard_min_cgroup_available_mb: float = 0.0
+    memory_guard_max_cgroup_used_fraction: float = 0.80
+    memory_guard_graceful_exit: bool = True
+    memory_guard_exit_code: int = 75
+    memory_guard_train_partial_batch: bool = False
     loss_fn: str = "ppo"
     loss_fn_config_json: str = ""
     ppo_clip_low_threshold: float = 0.8
@@ -1010,6 +1388,7 @@ class CLIConfig:
     answerability_probe_interval_turns: int = 8
     answerability_probe_min_maturity: float = 0.45
     answerability_probe_repeats: int = 4
+    answerer_repeat_concurrency: int = 1
     judge_max_output_tokens: int = 64
     log_step_details: bool = False
     log_compaction_summaries: bool = False
@@ -1067,6 +1446,11 @@ async def cli_main(cli_config: CLIConfig) -> None:
         )
     if cli_config.answerer_workspace_mode != "synthetic_only":
         raise ValueError("This clean setup only supports answerer_workspace_mode=synthetic_only.")
+    if cli_config.answerer_repeat_concurrency < 1:
+        raise ValueError(
+            "answerer_repeat_concurrency must be a positive integer; "
+            f"got {cli_config.answerer_repeat_concurrency}."
+        )
     renderer_name = cli_config.renderer_name or model_info.get_recommended_renderer_name(
         cli_config.model_name
     )
@@ -1156,6 +1540,7 @@ async def cli_main(cli_config: CLIConfig) -> None:
         answerability_probe_interval_turns=cli_config.answerability_probe_interval_turns,
         answerability_probe_min_maturity=cli_config.answerability_probe_min_maturity,
         answerability_probe_repeats=cli_config.answerability_probe_repeats,
+        answerer_repeat_concurrency=cli_config.answerer_repeat_concurrency,
         judge_max_output_tokens=cli_config.judge_max_output_tokens,
         log_step_details=cli_config.log_step_details,
         log_compaction_summaries=cli_config.log_compaction_summaries,
@@ -1262,6 +1647,21 @@ async def cli_main(cli_config: CLIConfig) -> None:
             ram_spool_cleanup=cli_config.ram_spool_cleanup,
             ppo_clip_low_threshold=cli_config.ppo_clip_low_threshold,
             ppo_clip_high_threshold=cli_config.ppo_clip_high_threshold,
+            memory_guard_enabled=cli_config.memory_guard_enabled,
+            memory_guard_poll_seconds=cli_config.memory_guard_poll_seconds,
+            memory_guard_max_rss_mb=cli_config.memory_guard_max_rss_mb,
+            memory_guard_min_system_available_mb=(
+                cli_config.memory_guard_min_system_available_mb
+            ),
+            memory_guard_min_cgroup_available_mb=(
+                cli_config.memory_guard_min_cgroup_available_mb
+            ),
+            memory_guard_max_cgroup_used_fraction=(
+                cli_config.memory_guard_max_cgroup_used_fraction
+            ),
+            memory_guard_graceful_exit=cli_config.memory_guard_graceful_exit,
+            memory_guard_exit_code=cli_config.memory_guard_exit_code,
+            memory_guard_train_partial_batch=cli_config.memory_guard_train_partial_batch,
         )
 
     config = train.Config(
@@ -1293,4 +1693,8 @@ async def cli_main(cli_config: CLIConfig) -> None:
 
 if __name__ == "__main__":
     cli_config = chz.entrypoint(CLIConfig)
-    asyncio.run(cli_main(cli_config))
+    try:
+        asyncio.run(cli_main(cli_config))
+    except _MemoryGuardGracefulExit as exc:
+        logger.warning("Memory guard requested graceful exit: %s", exc.reason)
+        raise SystemExit(exc.exit_code) from exc

@@ -64,7 +64,9 @@ export TINKER_SYNTHFS_CONDA_ENV=tinker_synthfs_qwen35
 export SKIP_TINKER_ENV_INSTALL=1
 export WANDB_MODE=disabled
 export RAM_SPOOL_MINIBATCH_GROUPS=1
-export RAM_SPOOL_MAX_CONCURRENT_GROUPS=2
+export RAM_SPOOL_MAX_CONCURRENT_GROUPS=4
+export ANSWERER_REPEAT_CONCURRENCY=2
+export MEMORY_GUARD_MAX_CGROUP_USED_FRACTION=0.70
 ```
 
 The launcher writes a fresh local all-train index to `../data/tinker_synthetic_fs_alltrain/index.jsonl`
@@ -72,16 +74,35 @@ before starting training.
 It sources `../.env` automatically if that file exists.
 The launcher runs Python through `conda run -n ${TINKER_SYNTHFS_CONDA_ENV:-tinker_synthfs_qwen35}`.
 `RAM_SPOOL_MAX_CONCURRENT_GROUPS` caps live rollout groups during the disk-spooled
-sampling phase; `RAM_SPOOL_MINIBATCH_GROUPS` caps how many spooled groups are
-reloaded for each training chunk. Lower values reduce peak RAM at the cost of
-slower sampling or training.
+sampling phase. The local launcher default is `4` for memory headroom; raise it
+only after checking memory metrics, or set it to `0` to run all groups in the
+batch concurrently if you want maximum speed.
+`RAM_SPOOL_MINIBATCH_GROUPS` caps how many spooled groups are reloaded for each
+training chunk. Lower values reduce peak RAM at the cost of slower sampling or
+training. The memory guard defaults to `MEMORY_GUARD_MAX_CGROUP_USED_FRACTION=0.70`.
+`ANSWERER_REPEAT_CONCURRENCY` keeps the same terminal/probe repeat counts but
+runs independent answerer reward repeats concurrently; the launcher default is
+`2` to reduce reward latency without changing the averaged reward target. Lower
+it to `1` if Gemini or judge rate limits become the bottleneck, or raise it
+carefully if remote capacity has headroom.
+Peak reward-call pressure scales roughly with
+`RAM_SPOOL_MAX_CONCURRENT_GROUPS * group_size * ANSWERER_REPEAT_CONCURRENCY`.
+With the default launcher settings and `group_size=4`, this is about `32`
+in-flight answerer repeats.
 
 ## Launch Answerability-Only Run On SLURM
 
 ```bash
 cd /iris/u/asap7772/asmr_private/tinker_synthetic_fs_current
 
-# Default sweep: one array task per dataset.
+# Default non-array run: sweep index 1, matching the local launcher example
+# `bash run_qwen35_4b_answerability_local.sh 1`.
+sbatch --export=ALL run_qwen35_4b_answerability_slurm.sh
+
+# Explicitly run sweep index 1.
+sbatch --export=ALL,SLURM_SWEEP_INDEX=1 run_qwen35_4b_answerability_slurm.sh
+
+# Array sweep: one array task per dataset.
 sbatch --array=0-2 --export=ALL run_qwen35_4b_answerability_slurm.sh
 ```
 
@@ -92,8 +113,16 @@ export MAX_TURNS_SWEEP="16 32"
 sbatch --array=0-5 --export=ALL run_qwen35_4b_answerability_slurm.sh
 ```
 
-Without `--array`, the wrapper delegates to the local launcher unchanged, so all
-selected sweep entries run in the same SLURM allocation.
+To preserve the full reward setup while increasing reward-call parallelism:
+
+```bash
+sbatch --export=ALL,SLURM_SWEEP_INDEX=1,ANSWERER_REPEAT_CONCURRENCY=2 run_qwen35_4b_answerability_slurm.sh
+```
+
+Without `--array`, the wrapper passes `${SLURM_SWEEP_INDEX:-1}` to the local
+launcher. Set `SLURM_SWEEP_INDEX=all` to run every selected sweep entry in the
+same SLURM allocation, or pass a numeric first argument such as
+`run_qwen35_4b_answerability_slurm.sh 0` to override the default.
 
 ## Launch Streaming-Summarization Pass@4 Baseline
 
