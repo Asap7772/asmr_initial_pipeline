@@ -70,6 +70,8 @@ MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3.5-4B}"
 MODEL_CONTEXT_WINDOW_TOKENS="${MODEL_CONTEXT_WINDOW_TOKENS:-65536}"
 CONTEXT_WINDOW_SAFETY_TOKENS="${CONTEXT_WINDOW_SAFETY_TOKENS:-256}"
 MAX_TRAJECTORY_TOKENS="${MAX_TRAJECTORY_TOKENS:-140000}"
+RAM_SPOOL_MINIBATCH_GROUPS="${RAM_SPOOL_MINIBATCH_GROUPS:-4}"
+RAM_SPOOL_MAX_CONCURRENT_GROUPS="${RAM_SPOOL_MAX_CONCURRENT_GROUPS:-4}"
 MAX_TURNS="${MAX_TURNS:-32}"
 if [ -n "${MAX_TURNS_SWEEP:-}" ]; then
   read -r -a SWEEP_MAX_TURNS_VALUES <<< "$MAX_TURNS_SWEEP"
@@ -90,6 +92,14 @@ for max_turns_value in "${SWEEP_MAX_TURNS_VALUES[@]}"; do
 done
 if [ -n "${ANSWERER_MAX_TURNS:-}" ] && ! [[ "$ANSWERER_MAX_TURNS" =~ ^[1-9][0-9]*$ ]]; then
   echo "ANSWERER_MAX_TURNS must be a positive integer, got: $ANSWERER_MAX_TURNS" >&2
+  exit 2
+fi
+if ! [[ "$RAM_SPOOL_MAX_CONCURRENT_GROUPS" =~ ^[0-9]+$ ]]; then
+  echo "RAM_SPOOL_MAX_CONCURRENT_GROUPS must be a non-negative integer, got: $RAM_SPOOL_MAX_CONCURRENT_GROUPS" >&2
+  exit 2
+fi
+if ! [[ "$RAM_SPOOL_MINIBATCH_GROUPS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "RAM_SPOOL_MINIBATCH_GROUPS must be a positive integer, got: $RAM_SPOOL_MINIBATCH_GROUPS" >&2
   exit 2
 fi
 RUN_ROOT="${RUN_ROOT:-$REPO_ROOT/tinker_runs}"
@@ -187,6 +197,8 @@ run_one_dataset() {
   echo "MODEL_CONTEXT_WINDOW_TOKENS=$MODEL_CONTEXT_WINDOW_TOKENS"
   echo "CONTEXT_WINDOW_SAFETY_TOKENS=$CONTEXT_WINDOW_SAFETY_TOKENS"
   echo "MAX_TRAJECTORY_TOKENS=$MAX_TRAJECTORY_TOKENS"
+  echo "RAM_SPOOL_MINIBATCH_GROUPS=$RAM_SPOOL_MINIBATCH_GROUPS"
+  echo "RAM_SPOOL_MAX_CONCURRENT_GROUPS=$RAM_SPOOL_MAX_CONCURRENT_GROUPS"
   echo "DATA_ROOT=$DATA_ROOT"
   echo "AGENT_DIR=$AGENT_DIR"
   echo "PRIVILEGED_DIR=$PRIVILEGED_DIR"
@@ -291,7 +303,8 @@ run_one_dataset() {
     rolling_ttl_seconds=604800 \
     ram_spool_enabled=true \
     ram_spool_dir="$ram_spool_dir" \
-    ram_spool_minibatch_groups=4 \
+    ram_spool_minibatch_groups="$RAM_SPOOL_MINIBATCH_GROUPS" \
+    ram_spool_max_concurrent_groups="$RAM_SPOOL_MAX_CONCURRENT_GROUPS" \
     ram_spool_cleanup=true \
     log_path="$run_dir" \
     wandb_project=synthetic-fs-rl \
@@ -308,6 +321,8 @@ echo "SWEEP_DATASETS=${SWEEP_DATASET_PATHS[*]}"
 echo "MAX_TURNS_SWEEP=${SWEEP_MAX_TURNS_VALUES[*]}"
 echo "ANSWERER_MAX_TURNS=${ANSWERER_MAX_TURNS:-follow_max_turns}"
 echo "MODEL_NAME=$MODEL_NAME"
+echo "RAM_SPOOL_MINIBATCH_GROUPS=$RAM_SPOOL_MINIBATCH_GROUPS"
+echo "RAM_SPOOL_MAX_CONCURRENT_GROUPS=$RAM_SPOOL_MAX_CONCURRENT_GROUPS"
 echo "DATA_ROOT=$DATA_ROOT"
 echo "AGENT_DIR=$AGENT_DIR"
 echo "PRIVILEGED_DIR=$PRIVILEGED_DIR"
@@ -378,7 +393,7 @@ for sweep_i in "${!selected_dataset_paths[@]}"; do
   if [ -n "${RUN_DIR:-}" ]; then
     run_dir="$RUN_DIR/${dataset_slug}_${turn_slug}"
   fi
-  ram_spool_dir="${RAM_SPOOL_DIR:-/scr/asap7772/tinker_synthfs_spool/$run_name}"
+  ram_spool_dir="${RAM_SPOOL_DIR:-${TMPDIR:-/tmp}/tinker_synthfs_spool/$run_name}"
   if [ -n "${RAM_SPOOL_DIR:-}" ]; then
     ram_spool_dir="$RAM_SPOOL_DIR/${dataset_slug}_${turn_slug}"
   fi

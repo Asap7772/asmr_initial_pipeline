@@ -654,6 +654,7 @@ def _install_spooled_sync_training_patch(
     *,
     ram_spool_dir: str,
     ram_spool_minibatch_groups: int,
+    ram_spool_max_concurrent_groups: int,
     ram_spool_cleanup: bool,
     ppo_clip_low_threshold: float,
     ppo_clip_high_threshold: float,
@@ -661,6 +662,11 @@ def _install_spooled_sync_training_patch(
     if ram_spool_minibatch_groups <= 0:
         raise ValueError(
             f"ram_spool_minibatch_groups must be positive, got {ram_spool_minibatch_groups}"
+        )
+    if ram_spool_max_concurrent_groups < 0:
+        raise ValueError(
+            "ram_spool_max_concurrent_groups must be non-negative, got "
+            f"{ram_spool_max_concurrent_groups}"
         )
 
     spool_root = Path(ram_spool_dir).expanduser().resolve()
@@ -725,6 +731,12 @@ def _install_spooled_sync_training_patch(
                         metrics.update(eval_metrics)
 
                     env_group_builders_P = dataset.get_batch(i_batch)
+                    max_concurrent_groups = (
+                        len(env_group_builders_P)
+                        if ram_spool_max_concurrent_groups == 0
+                        else min(ram_spool_max_concurrent_groups, len(env_group_builders_P))
+                    )
+                    metrics["ram_spool/max_concurrent_groups"] = float(max_concurrent_groups)
                     spooled_files: list[Path] = []
                     training_files: list[Path] = []
                     first_success_file: Path | None = None
@@ -797,9 +809,17 @@ def _install_spooled_sync_training_patch(
                                     included_for_training=included_for_training,
                                 )
 
+                            semaphore = asyncio.Semaphore(max_concurrent_groups)
+
+                            async def run_one_group_bounded(
+                                group_idx: int, builder: Any
+                            ) -> _SpooledGroupRecord:
+                                async with semaphore:
+                                    return await run_one_group(group_idx, builder)
+
                             tasks = [
                                 asyncio.create_task(
-                                    run_one_group(i, builder),
+                                    run_one_group_bounded(i, builder),
                                     name=f"spooled_trajectory_group_worker_{i}",
                                 )
                                 for i, builder in enumerate(env_group_builders_P)
@@ -923,6 +943,7 @@ class CLIConfig:
     ram_spool_enabled: bool = False
     ram_spool_dir: str = "/scr/asap7772/tinker_synthfs_spool"
     ram_spool_minibatch_groups: int = 4
+    ram_spool_max_concurrent_groups: int = 0
     ram_spool_cleanup: bool = True
     loss_fn: str = "ppo"
     loss_fn_config_json: str = ""
@@ -1237,6 +1258,7 @@ async def cli_main(cli_config: CLIConfig) -> None:
         _install_spooled_sync_training_patch(
             ram_spool_dir=cli_config.ram_spool_dir,
             ram_spool_minibatch_groups=cli_config.ram_spool_minibatch_groups,
+            ram_spool_max_concurrent_groups=cli_config.ram_spool_max_concurrent_groups,
             ram_spool_cleanup=cli_config.ram_spool_cleanup,
             ppo_clip_low_threshold=cli_config.ppo_clip_low_threshold,
             ppo_clip_high_threshold=cli_config.ppo_clip_high_threshold,

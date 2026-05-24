@@ -90,11 +90,15 @@ logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_AGENT_PROMPT_PATH = REPO_ROOT / "retrieval" / "agentic_rag_query.md"
-DEFAULT_RETRIEVAL_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_agentic_retrieval_qwen.jsonl"
-DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_agentic_answers_qwen.jsonl"
-DEFAULT_GOLD_AND_SUPPORT_ONLY=True
-DEFAULT_NON_LOCAL_AGENT = False
-DEFAULT_NON_LOCAL_ANSWERER = False
+DEFAULT_RETRIEVAL_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_agentic_retrieval_gemini.jsonl"
+DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_agentic_answers_gemini.jsonl"
+DEFAULT_GOLD_AND_SUPPORT_ONLY=False
+DEFAULT_NON_LOCAL_AGENT = True
+DEFAULT_NON_LOCAL_ANSWERER = True
+PLANNER_SEARCH_BUDGET = 1
+LOW_YIELD_NEW_DOC_THRESHOLD = 1
+PLANNER_SEARCH_HISTORY_LIMIT = 2
+PLANNER_SNIPPET_CHAR_LIMIT = 350
 
 @dataclass(frozen=True)
 class SearchHit:
@@ -496,6 +500,26 @@ def truncate_text(text: str, max_chars: int) -> str:
     return text[: max_chars - 3].rstrip() + "..."
 
 
+def effective_agent_observation_docs(args: argparse.Namespace) -> int:
+    return max(1, min(args.agent_observation_docs, args.search_top_k, args.final_top_k))
+
+
+def effective_agent_context_docs(args: argparse.Namespace) -> int:
+    return max(1, min(args.agent_context_docs, max(args.search_top_k, args.final_top_k)))
+
+
+def effective_agent_snippet_chars(args: argparse.Namespace) -> int:
+    if args.agent_max_snippet_chars <= 0:
+        return 0
+    return min(args.agent_max_snippet_chars, PLANNER_SNIPPET_CHAR_LIMIT)
+
+
+def effective_search_history(
+    search_steps: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return search_steps[-PLANNER_SEARCH_HISTORY_LIMIT:]
+
+
 def hit_to_observation(hit: SearchHit, *, max_snippet_chars: int) -> dict[str, Any]:
     doc = hit.document
     observation: dict[str, Any] = {
@@ -542,18 +566,22 @@ def build_planner_prompt(
     search_steps: list[dict[str, Any]],
     aggregate: dict[str, AggregatedDocument],
     iteration: int,
+    agent_search_count: int,
     args: argparse.Namespace,
 ) -> str:
-    ranked_candidates = rank_aggregated_documents(aggregate)[: args.agent_context_docs]
+    snippet_chars = effective_agent_snippet_chars(args)
+    ranked_candidates = rank_aggregated_documents(aggregate)[: effective_agent_context_docs(args)]
     user_payload = {
         "question": question,
         "iteration": iteration,
         "max_iterations": args.max_iterations,
         "search_top_k": args.search_top_k,
         "final_top_k": args.final_top_k,
-        "previous_searches": search_steps,
+        "previous_searches": effective_search_history(search_steps),
+        "agent_searches_used": agent_search_count,
+        "planner_search_budget": PLANNER_SEARCH_BUDGET,
         "best_candidate_documents": [
-            aggregated_to_observation(doc, max_snippet_chars=args.agent_max_snippet_chars)
+            aggregated_to_observation(doc, max_snippet_chars=snippet_chars)
             for doc in ranked_candidates
         ],
     }
@@ -658,11 +686,13 @@ def normalized_query(query: str) -> str:
     return compact_whitespace(query).lower()
 
 
-def add_hits_to_aggregate(aggregate: dict[str, AggregatedDocument], hits: list[SearchHit]) -> None:
+def add_hits_to_aggregate(aggregate: dict[str, AggregatedDocument], hits: list[SearchHit]) -> int:
+    num_new_documents = 0
     for hit in hits:
         key = hit.document.rel_path
         existing = aggregate.get(key)
         if existing is None:
+            num_new_documents += 1
             aggregate[key] = AggregatedDocument(
                 document=hit.document,
                 best_score=hit.score,
@@ -681,6 +711,7 @@ def add_hits_to_aggregate(aggregate: dict[str, AggregatedDocument], hits: list[S
             existing.best_score = hit.score
             existing.best_rank = hit.rank
             existing.best_query = hit.query
+    return num_new_documents
 
 
 def rank_aggregated_documents(aggregate: dict[str, AggregatedDocument]) -> list[AggregatedDocument]:
@@ -758,15 +789,18 @@ def search_step_record(
     iteration: int,
     query: str,
     hits: list[SearchHit],
+    num_new_documents: int,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
+    snippet_chars = effective_agent_snippet_chars(args)
     return {
         "iteration": iteration,
         "query": query,
         "num_hits": len(hits),
+        "num_new_documents": num_new_documents,
         "documents": [
-            hit_to_observation(hit, max_snippet_chars=args.agent_max_snippet_chars)
-            for hit in hits[: args.agent_observation_docs]
+            hit_to_observation(hit, max_snippet_chars=snippet_chars)
+            for hit in hits[: effective_agent_observation_docs(args)]
         ],
     }
 
@@ -839,20 +873,39 @@ def run_agentic_retrieval_for_question(
     seen_queries: set[str] = set()
     selected_paths: list[str] = []
     stop_reason = "max_iterations"
+    agent_search_count = 0
 
     if args.initial_search:
         hits = index.search(question, top_k=args.search_top_k, iteration=0)
-        add_hits_to_aggregate(aggregate, hits)
-        search_steps.append(search_step_record(iteration=0, query=question, hits=hits, args=args))
+        num_new_documents = add_hits_to_aggregate(aggregate, hits)
+        search_steps.append(
+            search_step_record(
+                iteration=0,
+                query=question,
+                hits=hits,
+                num_new_documents=num_new_documents,
+                args=args,
+            )
+        )
         seen_queries.add(normalized_query(question))
 
+    if len(aggregate) >= args.final_top_k:
+        stop_reason = "initial_search_sufficient"
+
     for iteration in range(1, args.max_iterations + 1):
+        if stop_reason == "initial_search_sufficient":
+            break
+        if agent_search_count >= PLANNER_SEARCH_BUDGET:
+            stop_reason = "planner_search_budget"
+            break
+
         prompt = build_planner_prompt(
             system_prompt,
             question=question,
             search_steps=search_steps,
             aggregate=aggregate,
             iteration=iteration,
+            agent_search_count=agent_search_count,
             args=args,
         )
         raw_response = planner.propose(prompt)
@@ -888,10 +941,27 @@ def run_agentic_retrieval_for_question(
             break
 
         hits = index.search(query, top_k=args.search_top_k, iteration=iteration)
-        add_hits_to_aggregate(aggregate, hits)
+        num_new_documents = add_hits_to_aggregate(aggregate, hits)
+        agent_search_count += 1
+        planner_record["num_new_documents"] = num_new_documents
         seen_queries.add(normalized)
-        search_steps.append(search_step_record(iteration=iteration, query=query, hits=hits, args=args))
+        search_steps.append(
+            search_step_record(
+                iteration=iteration,
+                query=query,
+                hits=hits,
+                num_new_documents=num_new_documents,
+                args=args,
+            )
+        )
         planner_steps.append(planner_record)
+        if (
+            LOW_YIELD_NEW_DOC_THRESHOLD > 0
+            and num_new_documents < LOW_YIELD_NEW_DOC_THRESHOLD
+        ):
+            planner_record["low_yield_search"] = True
+            stop_reason = "low_yield_search"
+            break
 
     final_documents = resolve_selected_documents(
         aggregate,
@@ -910,6 +980,10 @@ def run_agentic_retrieval_for_question(
         "agent_provider": planner.provider_name,
         "agent_model": planner.model_name,
         "agent_max_iterations": args.max_iterations,
+        "agent_planner_search_budget": PLANNER_SEARCH_BUDGET,
+        "agent_num_searches": len(search_steps),
+        "agent_num_planned_searches": agent_search_count,
+        "agent_low_yield_new_doc_threshold": LOW_YIELD_NEW_DOC_THRESHOLD,
         "agent_num_iterations": len(planner_steps),
         "agent_stop_reason": stop_reason,
         "agent_queries": queries,
