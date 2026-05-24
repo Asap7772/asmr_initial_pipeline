@@ -29,7 +29,6 @@ try:
     )
     from retrieval.retrieve_proc_heldout import (
         DEFAULT_DOCS_DIR,
-        DEFAULT_GOLD_AND_SUPPORT_ONLY,
         DEFAULT_PRIVILEGED_DIR,
         DEFAULT_QUESTIONS_PATH,
         CandidateDocument,
@@ -56,7 +55,6 @@ except ModuleNotFoundError as exc:
     )
     from retrieve_proc_heldout import (
         DEFAULT_DOCS_DIR,
-        DEFAULT_GOLD_AND_SUPPORT_ONLY,
         DEFAULT_PRIVILEGED_DIR,
         DEFAULT_QUESTIONS_PATH,
         CandidateDocument,
@@ -93,6 +91,9 @@ logger = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RETRIEVAL_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_graph_retrieval_qwen.jsonl"
 DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_graph_answers_qwen.jsonl"
+DEFAULT_GOLD_AND_SUPPORT_ONLY = False
+DEFAULT_MAX_INDEX_DOCS = 0
+FORCE_FULL_DOCUMENT_CORPUS = True
 DEFAULT_NON_LOCAL_GRAPH = False
 DEFAULT_NON_LOCAL_ANSWERER = False
 
@@ -404,8 +405,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-index-docs",
         type=int,
-        default=30,
-        help="Dense-prefilter to this many documents before graph extraction. Use 0 to graph all loaded docs.",
+        default=DEFAULT_MAX_INDEX_DOCS,
+        help=(
+            "Dense-prefilter to this many documents before graph extraction. "
+            "Retained for CLI compatibility; this script currently forces full graph indexing."
+        ),
     )
     parser.add_argument("--max-extract-input-chars", type=int, default=6500)
     parser.add_argument("--summarize-descriptions", action=argparse.BooleanOptionalAction, default=False)
@@ -425,7 +429,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embedding-gpu-memory-utilization", type=float, default=None)
     parser.add_argument("--normalize", action="store_true")
     parser.add_argument("--max-doc-chars", type=int, default=30_000)
-    parser.add_argument("--gold-and-support-only", action=argparse.BooleanOptionalAction, default=DEFAULT_GOLD_AND_SUPPORT_ONLY)
+    parser.add_argument(
+        "--gold-and-support-only",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_GOLD_AND_SUPPORT_ONLY,
+        help="Retained for CLI compatibility; this script forces retrieval over all candidate documents.",
+    )
     parser.add_argument("--no-text", action="store_true", help="Omit document text from retrieval JSONL.")
 
     parser.add_argument("--report-context-top-k", type=int, default=3)
@@ -507,7 +516,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--embedding-batch-size must be at least 1")
     if args.max_doc_chars < 0:
         parser.error("--max-doc-chars must be >= 0")
-    if args.gold_and_support_only and args.privileged_dir is None:
+    if FORCE_FULL_DOCUMENT_CORPUS:
+        args.gold_and_support_only = False
+        args.max_index_docs = 0
+    elif args.gold_and_support_only and args.privileged_dir is None:
         parser.error("--gold-and-support-only requires --privileged-dir")
     if args.report_context_top_k < 0:
         parser.error("--report-context-top-k must be >= 0")
@@ -519,6 +531,12 @@ def parse_args() -> argparse.Namespace:
             "pass --skip-answer or --report-context-top-k 0"
         )
     return args
+
+
+def enforce_full_document_corpus(args: argparse.Namespace) -> None:
+    if FORCE_FULL_DOCUMENT_CORPUS:
+        args.gold_and_support_only = False
+        args.max_index_docs = 0
 
 
 def compact_whitespace(text: str) -> str:
@@ -1109,6 +1127,8 @@ def choose_index_documents(
     documents: list[CandidateDocument],
     args: argparse.Namespace,
 ) -> list[CandidateDocument]:
+    if FORCE_FULL_DOCUMENT_CORPUS:
+        return documents
     if not args.max_index_docs or len(documents) <= args.max_index_docs:
         return documents
     return documents[: args.max_index_docs]
@@ -1284,6 +1304,7 @@ def run_graph_retrieval_for_question(
     generator: GraphGenerator,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
+    enforce_full_document_corpus(args)
     if not documents:
         return build_fallback_record(
             question_entry=question_entry,
@@ -1434,6 +1455,7 @@ def stop_component(name: str, component: Any) -> None:
 
 
 def run_graph_retrieval(args: argparse.Namespace) -> list[dict[str, Any]]:
+    enforce_full_document_corpus(args)
     questions = select_questions(load_heldout_questions(args.questions_path), args.query_id, args.limit)
     logger.info("Loaded %d heldout questions", len(questions))
 
@@ -1451,7 +1473,7 @@ def run_graph_retrieval(args: argparse.Namespace) -> list[dict[str, Any]]:
                     args.privileged_dir,
                     question_id,
                     args.max_doc_chars,
-                    gold_and_support_only=bool(args.gold_and_support_only),
+                    gold_and_support_only=False,
                 )
                 record = run_graph_retrieval_for_question(
                     question_entry=question_entry,

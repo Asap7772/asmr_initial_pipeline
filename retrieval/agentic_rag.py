@@ -93,6 +93,7 @@ DEFAULT_AGENT_PROMPT_PATH = REPO_ROOT / "retrieval" / "agentic_rag_query.md"
 DEFAULT_RETRIEVAL_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_agentic_retrieval_gemini.jsonl"
 DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_agentic_answers_gemini.jsonl"
 DEFAULT_GOLD_AND_SUPPORT_ONLY=False
+FORCE_FULL_DOCUMENT_CORPUS = True
 DEFAULT_NON_LOCAL_AGENT = True
 DEFAULT_NON_LOCAL_ANSWERER = True
 PLANNER_SEARCH_BUDGET = 1
@@ -355,6 +356,7 @@ def parse_args() -> argparse.Namespace:
         "--gold-and-support-only",
         action=argparse.BooleanOptionalAction,
         default=DEFAULT_GOLD_AND_SUPPORT_ONLY,
+        help="Retained for CLI compatibility; this script forces retrieval over all candidate documents.",
     )
     parser.add_argument("--no-text", action="store_true", help="Omit document text from retrieval JSONL.")
 
@@ -426,9 +428,16 @@ def parse_args() -> argparse.Namespace:
         parser.error("--embedding-batch-size must be at least 1")
     if args.max_doc_chars < 0:
         parser.error("--max-doc-chars must be >= 0")
-    if args.gold_and_support_only and args.privileged_dir is None:
+    if FORCE_FULL_DOCUMENT_CORPUS:
+        args.gold_and_support_only = False
+    elif args.gold_and_support_only and args.privileged_dir is None:
         parser.error("--gold-and-support-only requires --privileged-dir")
     return args
+
+
+def enforce_full_document_corpus(args: argparse.Namespace) -> None:
+    if FORCE_FULL_DOCUMENT_CORPUS:
+        args.gold_and_support_only = False
 
 
 def render_agent_template(
@@ -859,6 +868,7 @@ def run_agentic_retrieval_for_question(
     system_prompt: str,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
+    enforce_full_document_corpus(args)
     question = question_entry["question"]
     index = QuestionRetrievalIndex(
         embedding_model,
@@ -1001,6 +1011,7 @@ def run_agentic_retrieval_for_question(
 
 
 def run_agentic_retrieval(args: argparse.Namespace) -> list[dict[str, Any]]:
+    enforce_full_document_corpus(args)
     questions = select_questions(load_heldout_questions(args.questions_path), args.query_id, args.limit)
     logger.info("Loaded %d heldout questions", len(questions))
 
@@ -1034,7 +1045,7 @@ def run_agentic_retrieval(args: argparse.Namespace) -> list[dict[str, Any]]:
                     args.privileged_dir,
                     question_id,
                     args.max_doc_chars,
-                    gold_and_support_only=bool(args.gold_and_support_only),
+                    gold_and_support_only=False,
                 )
                 record = run_agentic_retrieval_for_question(
                     question_entry=question_entry,
