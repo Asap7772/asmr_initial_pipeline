@@ -17,6 +17,7 @@ from tqdm import tqdm
 BRIGHT_DATASET = "xlangai/BRIGHT"
 DEFAULT_OUTPUT_ROOT = Path("data/bright")
 DEFAULT_QUERIES_PER_DOMAIN = 10
+DEFAULT_MAX_DOCUMENTS_PER_DOMAIN = 50
 DEFAULT_SEED = 0
 HASH_LENGTH = 12
 MAX_DOCID_SLUG_LENGTH = 96
@@ -34,10 +35,25 @@ class SelectedExample:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build a browse-comp-style gold-only filesystem dataset from BRIGHT."
+        description="Build a browse-comp-style filesystem dataset from BRIGHT."
     )
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--queries-per-domain", type=int, default=DEFAULT_QUERIES_PER_DOMAIN)
+    parser.add_argument(
+        "--max-documents-per-domain",
+        type=int,
+        default=DEFAULT_MAX_DOCUMENTS_PER_DOMAIN,
+        help=(
+            "Maximum documents to expose per BRIGHT domain when adding noisy documents. "
+            "Selected gold documents are always kept, even if they exceed this limit."
+        ),
+    )
+    parser.add_argument(
+        "--gold-docs-only",
+        "--gold-documents-only",
+        action="store_true",
+        help="Only expose gold documents from the selected examples; do not add noisy documents.",
+    )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument(
         "--domains",
@@ -49,6 +65,8 @@ def parse_args() -> argparse.Namespace:
 
     if args.queries_per_domain < 1:
         parser.error("--queries-per-domain must be at least 1")
+    if args.max_documents_per_domain < 1:
+        parser.error("--max-documents-per-domain must be at least 1")
     return args
 
 
@@ -219,6 +237,40 @@ def load_required_documents(documents: Dataset, required_doc_ids: set[str]) -> d
     return loaded_docs
 
 
+def load_domain_documents(
+    documents: Dataset,
+    *,
+    required_doc_ids: set[str],
+    max_documents_per_domain: int,
+    gold_docs_only: bool,
+    domain: str,
+    seed: int,
+) -> dict[str, str]:
+    loaded_docs = load_required_documents(documents, required_doc_ids)
+    if gold_docs_only:
+        return loaded_docs
+
+    target_doc_count = min(max(max_documents_per_domain, len(loaded_docs)), len(documents))
+    if len(loaded_docs) >= target_doc_count:
+        return loaded_docs
+
+    rng = random.Random(f"{seed}:{domain}:noisy_documents")
+    sampled_indices = list(range(len(documents)))
+    rng.shuffle(sampled_indices)
+
+    for index in sampled_indices:
+        row = documents[index]
+        doc_id = str(row["id"])
+        if not doc_id or doc_id in loaded_docs:
+            continue
+
+        loaded_docs[doc_id] = str(row.get("content", ""))
+        if len(loaded_docs) >= target_doc_count:
+            break
+
+    return loaded_docs
+
+
 def validate_required_documents(
     selected_by_domain: dict[str, list[SelectedExample]],
     docs_by_domain: dict[str, dict[str, str]],
@@ -261,7 +313,6 @@ def manifest_doc_record(
 def write_query_files(
     *,
     example: SelectedExample,
-    domain_gold_ids: set[str],
     docs_by_id: dict[str, str],
     train_dir: Path,
     privileged_dir: Path,
@@ -289,7 +340,7 @@ def write_query_files(
 
     used_names: set[str] = set()
     current_gold_ids = set(example.gold_ids)
-    negative_ids = sorted(domain_gold_ids - current_gold_ids)
+    negative_ids = sorted(set(docs_by_id) - current_gold_ids)
 
     for label, doc_ids in (("gold_docs", example.gold_ids), ("negative_docs", negative_ids)):
         label_dir = privileged_query_dir / label
@@ -328,6 +379,8 @@ def write_dataset(
     docs_by_domain: dict[str, dict[str, str]],
     output_root: Path,
     queries_per_domain: int,
+    max_documents_per_domain: int,
+    gold_docs_only: bool,
     seed: int,
 ) -> None:
     train_dir = output_root / "train"
@@ -337,12 +390,10 @@ def write_dataset(
 
     questions: list[dict[str, Any]] = []
     for domain, selected_examples in selected_by_domain.items():
-        domain_gold_ids = collect_required_doc_ids(selected_examples)
         for example in tqdm(selected_examples, desc=f"Writing {domain}"):
             questions.append(
                 write_query_files(
                     example=example,
-                    domain_gold_ids=domain_gold_ids,
                     docs_by_id=docs_by_domain[domain],
                     train_dir=train_dir,
                     privileged_dir=privileged_dir,
@@ -353,6 +404,11 @@ def write_dataset(
         "name": f"bright_{queries_per_domain}_questions_per_domain",
         "source_dataset": BRIGHT_DATASET,
         "queries_per_domain": queries_per_domain,
+        "max_documents_per_domain": None if gold_docs_only else max_documents_per_domain,
+        "gold_docs_only": gold_docs_only,
+        "documents_per_domain": {
+            domain: len(docs_by_id) for domain, docs_by_id in docs_by_domain.items()
+        },
         "seed": seed,
         "num_questions": len(questions),
         "questions": questions,
@@ -377,7 +433,14 @@ def main() -> None:
     docs_by_domain: dict[str, dict[str, str]] = {}
     for domain in domains:
         required_doc_ids = collect_required_doc_ids(selected_by_domain[domain])
-        docs_by_domain[domain] = load_required_documents(documents[domain], required_doc_ids)
+        docs_by_domain[domain] = load_domain_documents(
+            documents[domain],
+            required_doc_ids=required_doc_ids,
+            max_documents_per_domain=args.max_documents_per_domain,
+            gold_docs_only=args.gold_docs_only,
+            domain=domain,
+            seed=args.seed,
+        )
 
     validate_required_documents(selected_by_domain, docs_by_domain)
     write_dataset(
@@ -385,6 +448,8 @@ def main() -> None:
         docs_by_domain=docs_by_domain,
         output_root=args.output_root,
         queries_per_domain=args.queries_per_domain,
+        max_documents_per_domain=args.max_documents_per_domain,
+        gold_docs_only=args.gold_docs_only,
         seed=args.seed,
     )
 

@@ -90,17 +90,17 @@ logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_AGENT_PROMPT_PATH = REPO_ROOT / "retrieval" / "agentic_rag_query.md"
-DEFAULT_RETRIEVAL_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_agentic_retrieval_qwen.jsonl"
-DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_agentic_answers_qwen.jsonl"
+DEFAULT_RETRIEVAL_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_agentic_retrieval_gemini.jsonl"
+DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_agentic_answers_gemini.jsonl"
 DEFAULT_GOLD_AND_SUPPORT_ONLY=False
 FORCE_FULL_DOCUMENT_CORPUS = True
-DEFAULT_NON_LOCAL_AGENT = False
-DEFAULT_NON_LOCAL_ANSWERER = False
+DEFAULT_NON_LOCAL_AGENT = True
+DEFAULT_NON_LOCAL_ANSWERER = True
 DEFAULT_LOCAL_RETRIEVAL_GPU_MEMORY_UTILIZATION = 0.9
 MIN_LOCAL_RETRIEVAL_GPU_MEMORY_UTILIZATION = 0.05
 DEFAULT_LOCAL_ANSWER_GPU_MEMORY_UTILIZATION = 0.9
 DEFAULT_LOCAL_AGENT_MAX_MODEL_LEN = 8192
-PLANNER_SEARCH_BUDGET = 1
+DEFAULT_PLANNER_SEARCH_BUDGET = 1
 LOW_YIELD_NEW_DOC_THRESHOLD = 1
 PLANNER_SEARCH_HISTORY_LIMIT = 2
 PLANNER_SNIPPET_CHAR_LIMIT = 350
@@ -354,6 +354,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--agent-extended-relevance", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--agent-enforce-top-k", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--initial-search", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--planner-search-budget",
+        type=int,
+        default=DEFAULT_PLANNER_SEARCH_BUDGET,
+        help=(
+            "Maximum number of agent-planned searches after the optional initial search. "
+            "With --initial-search, the dense retrieval hit budget is roughly "
+            "(1 + planner_search_budget) * search_top_k before choosing final_top_k documents."
+        ),
+    )
 
     parser.add_argument("--embedding-model-name-or-path", default="Qwen/Qwen3-Embedding-4B")
     parser.add_argument("--embedding-instruction", default=None)
@@ -458,6 +468,8 @@ def parse_args() -> argparse.Namespace:
             )
     if args.max_iterations < 0:
         parser.error("--max-iterations must be >= 0")
+    if args.planner_search_budget < 0:
+        parser.error("--planner-search-budget must be >= 0")
     if args.search_top_k < 1:
         parser.error("--search-top-k must be at least 1")
     if args.final_top_k < 1:
@@ -682,6 +694,7 @@ def build_planner_prompt(
 ) -> str:
     snippet_chars = effective_agent_snippet_chars(args)
     ranked_candidates = rank_aggregated_documents(aggregate)[: effective_agent_context_docs(args)]
+    searches_remaining = max(0, args.planner_search_budget - agent_search_count)
     user_payload = {
         "question": question,
         "iteration": iteration,
@@ -690,7 +703,8 @@ def build_planner_prompt(
         "final_top_k": args.final_top_k,
         "previous_searches": effective_search_history(search_steps),
         "agent_searches_used": agent_search_count,
-        "planner_search_budget": PLANNER_SEARCH_BUDGET,
+        "planner_search_budget": args.planner_search_budget,
+        "agent_searches_remaining": searches_remaining,
         "best_candidate_documents": [
             aggregated_to_observation(doc, max_snippet_chars=snippet_chars)
             for doc in ranked_candidates
@@ -708,6 +722,7 @@ Return only valid JSON, with one of these shapes:
 {{"thought": "brief reason", "action": "final_results", "document_paths": ["path/a.txt", "path/b.txt"]}}
 
 Do not answer the question. Search queries should be specific, diverse, and useful for finding missing evidence.
+If agent_searches_remaining is 0, return final_results.
 
 PAYLOAD:
 {json.dumps(user_payload, ensure_ascii=False, indent=2)}
@@ -1001,16 +1016,7 @@ def run_agentic_retrieval_for_question(
         )
         seen_queries.add(normalized_query(question))
 
-    if len(aggregate) >= args.final_top_k:
-        stop_reason = "initial_search_sufficient"
-
     for iteration in range(1, args.max_iterations + 1):
-        if stop_reason == "initial_search_sufficient":
-            break
-        if agent_search_count >= PLANNER_SEARCH_BUDGET:
-            stop_reason = "planner_search_budget"
-            break
-
         prompt = build_planner_prompt(
             system_prompt,
             question=question,
@@ -1040,6 +1046,12 @@ def run_agentic_retrieval_for_question(
 
         query = (action.query or "").strip()
         planner_record["query"] = query
+        if agent_search_count >= args.planner_search_budget:
+            planner_record["search_budget_exhausted"] = True
+            planner_steps.append(planner_record)
+            stop_reason = "search_budget_exhausted"
+            break
+
         normalized = normalized_query(query)
         if not query:
             planner_record["parse_error"] = "Planner requested search without a query"
@@ -1072,8 +1084,6 @@ def run_agentic_retrieval_for_question(
             and num_new_documents < LOW_YIELD_NEW_DOC_THRESHOLD
         ):
             planner_record["low_yield_search"] = True
-            stop_reason = "low_yield_search"
-            break
 
     final_documents = resolve_selected_documents(
         aggregate,
@@ -1095,9 +1105,15 @@ def run_agentic_retrieval_for_question(
             None if args.non_local_agent else effective_agent_gpu_memory_utilization(args)
         ),
         "agent_max_iterations": args.max_iterations,
-        "agent_planner_search_budget": PLANNER_SEARCH_BUDGET,
+        "agent_planner_search_budget": args.planner_search_budget,
+        "agent_initial_search": bool(args.initial_search),
+        "agent_retrieval_hit_budget": (
+            (1 if args.initial_search else 0) + args.planner_search_budget
+        )
+        * args.search_top_k,
         "agent_num_searches": len(search_steps),
         "agent_num_planned_searches": agent_search_count,
+        "agent_num_candidate_documents_seen": len(aggregate),
         "agent_low_yield_new_doc_threshold": LOW_YIELD_NEW_DOC_THRESHOLD,
         "agent_num_iterations": len(planner_steps),
         "agent_stop_reason": stop_reason,
@@ -1187,6 +1203,12 @@ def run_agentic_retrieval(args: argparse.Namespace) -> list[dict[str, Any]]:
                     "agent_gpu_memory_utilization": (
                         None if args.non_local_agent else effective_agent_gpu_memory_utilization(args)
                     ),
+                    "agent_planner_search_budget": args.planner_search_budget,
+                    "agent_initial_search": bool(args.initial_search),
+                    "agent_retrieval_hit_budget": (
+                        (1 if args.initial_search else 0) + args.planner_search_budget
+                    )
+                    * args.search_top_k,
                     "gold_and_support_only": bool(args.gold_and_support_only),
                     "error": str(exc),
                     "retrieval_model": args.embedding_model_name_or_path,

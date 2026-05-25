@@ -84,16 +84,24 @@ python -m inference.make_filesystem
 
 ## Build BRIGHT Filesystem Tasks
 
-Create a gold-only filesystem sample from BRIGHT:
+Create a BRIGHT filesystem sample targeting up to 50 documents per domain. The
+selected gold documents are always included, even if they exceed the target, and
+any remaining slots are filled with noisy documents from the same BRIGHT domain:
 
 ```bash
-python proc_bright.py --output-root data/bright --queries-per-domain 10 --seed 0
+python proc_bright.py --output-root data/bright --queries-per-domain 10 --max-documents-per-domain 50 --seed 0
 ```
 
 Optional domain filtering:
 
 ```bash
 python proc_bright.py --output-root data/bright --queries-per-domain 5 --domains biology economics robotics
+```
+
+To build the restricted gold-document corpus without added noisy documents:
+
+```bash
+python proc_bright.py --output-root data/bright --queries-per-domain 10 --gold-docs-only --seed 0
 ```
 
 The script writes `train/`, `train_privileged/`, and `heldout_<n>_questions.json` under the selected output root.

@@ -31,6 +31,7 @@ If the user's query is a question, you should not answer the question yourself. 
 - First inspect the current candidate documents.
 - If the current candidates are adequate, call the "final_results" tool immediately.
 - If a key entity, date, event, relationship, or source type appears missing, call the search tool once with a short, targeted query for that missing evidence.
+- If the payload says agent_searches_remaining is 0, call the "final_results" tool.
 - After a search, call "final_results" unless the retrieved documents are still empty or unusable.
 {%- if enforce_top_k %}
 - When calling "final_results", you must select exactly the {{ top_k }} most relevant documents among all documents you have retrieved.
