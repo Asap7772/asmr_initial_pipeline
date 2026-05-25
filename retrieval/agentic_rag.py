@@ -90,12 +90,16 @@ logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_AGENT_PROMPT_PATH = REPO_ROOT / "retrieval" / "agentic_rag_query.md"
-DEFAULT_RETRIEVAL_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_agentic_retrieval_gemini.jsonl"
-DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_agentic_answers_gemini.jsonl"
+DEFAULT_RETRIEVAL_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_agentic_retrieval_qwen.jsonl"
+DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_agentic_answers_qwen.jsonl"
 DEFAULT_GOLD_AND_SUPPORT_ONLY=False
 FORCE_FULL_DOCUMENT_CORPUS = True
-DEFAULT_NON_LOCAL_AGENT = True
-DEFAULT_NON_LOCAL_ANSWERER = True
+DEFAULT_NON_LOCAL_AGENT = False
+DEFAULT_NON_LOCAL_ANSWERER = False
+DEFAULT_LOCAL_RETRIEVAL_GPU_MEMORY_UTILIZATION = 0.9
+MIN_LOCAL_RETRIEVAL_GPU_MEMORY_UTILIZATION = 0.05
+DEFAULT_LOCAL_ANSWER_GPU_MEMORY_UTILIZATION = 0.9
+DEFAULT_LOCAL_AGENT_MAX_MODEL_LEN = 8192
 PLANNER_SEARCH_BUDGET = 1
 LOW_YIELD_NEW_DOC_THRESHOLD = 1
 PLANNER_SEARCH_HISTORY_LIMIT = 2
@@ -325,8 +329,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--agent-tensor-parallel-size", type=int, default=None)
     parser.add_argument("--agent-distributed-executor-backend", default=None)
-    parser.add_argument("--agent-max-model-len", type=int, default=32768)
-    parser.add_argument("--agent-gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--agent-max-model-len", type=int, default=DEFAULT_LOCAL_AGENT_MAX_MODEL_LEN)
+    parser.add_argument(
+        "--agent-gpu-memory-utilization",
+        type=float,
+        default=None,
+        help=(
+            "GPU memory fraction for local planner vLLM. Defaults to an automatic split "
+            "with the embedding vLLM when --no-non-local-agent is used."
+        ),
+    )
     parser.add_argument("--agent-dtype", default="auto")
     parser.add_argument("--agent-trust-remote-code", action="store_true")
     parser.add_argument("--agent-temperature", type=float, default=0.0)
@@ -349,7 +361,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embedding-batch-size", type=int, default=128)
     parser.add_argument("--embedding-tensor-parallel-size", type=int, default=None)
     parser.add_argument("--embedding-max-model-len", type=int, default=None)
-    parser.add_argument("--embedding-gpu-memory-utilization", type=float, default=None)
+    parser.add_argument(
+        "--embedding-gpu-memory-utilization",
+        type=float,
+        default=None,
+        help=(
+            "GPU memory fraction for embedding vLLM. Defaults to an automatic split "
+            "with the local planner vLLM when --no-non-local-agent is used."
+        ),
+    )
     parser.add_argument("--normalize", action="store_true")
     parser.add_argument("--max-doc-chars", type=int, default=30_000)
     parser.add_argument(
@@ -380,7 +400,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, default=32768)
     parser.add_argument("--max-prompt-tokens", type=int, default=30000)
     parser.add_argument("--max-new-tokens", type=int, default=128)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=None,
+        help=(
+            "GPU memory fraction for the local answerer vLLM. Defaults to "
+            f"{DEFAULT_LOCAL_ANSWER_GPU_MEMORY_UTILIZATION}."
+        ),
+    )
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -412,6 +440,22 @@ def parse_args() -> argparse.Namespace:
         parser.error("--agent-tensor-parallel-size must be at least 1")
     if not args.non_local_agent and args.agent_max_model_len <= args.agent_max_completion_tokens:
         parser.error("--agent-max-model-len must be greater than --agent-max-completion-tokens")
+    for option_name in (
+        "agent_gpu_memory_utilization",
+        "embedding_gpu_memory_utilization",
+        "gpu_memory_utilization",
+    ):
+        value = getattr(args, option_name)
+        if value is not None and not (0.0 < value <= 1.0):
+            parser.error(f"--{option_name.replace('_', '-')} must be in (0, 1]")
+    if not args.non_local_agent:
+        agent_gpu_memory, embedding_gpu_memory = effective_local_retrieval_gpu_memory_utilizations(args)
+        if agent_gpu_memory + embedding_gpu_memory > 1.0:
+            parser.error(
+                "local planner and embedding vLLM GPU memory utilizations must sum to <= 1.0; "
+                f"got agent={agent_gpu_memory:.3f}, embedding={embedding_gpu_memory:.3f}. "
+                "Set --agent-gpu-memory-utilization and --embedding-gpu-memory-utilization explicitly."
+            )
     if args.max_iterations < 0:
         parser.error("--max-iterations must be >= 0")
     if args.search_top_k < 1:
@@ -438,6 +482,64 @@ def parse_args() -> argparse.Namespace:
 def enforce_full_document_corpus(args: argparse.Namespace) -> None:
     if FORCE_FULL_DOCUMENT_CORPUS:
         args.gold_and_support_only = False
+
+
+def effective_local_retrieval_gpu_memory_utilizations(args: argparse.Namespace) -> tuple[float, float]:
+    agent_gpu_memory = args.agent_gpu_memory_utilization
+    embedding_gpu_memory = args.embedding_gpu_memory_utilization
+
+    if agent_gpu_memory is None and embedding_gpu_memory is None:
+        split_gpu_memory = DEFAULT_LOCAL_RETRIEVAL_GPU_MEMORY_UTILIZATION / 2.0
+        return split_gpu_memory, split_gpu_memory
+
+    if agent_gpu_memory is None:
+        if embedding_gpu_memory is None:
+            raise ValueError("embedding GPU memory utilization is required to infer planner budget")
+        agent_gpu_memory = max(
+            MIN_LOCAL_RETRIEVAL_GPU_MEMORY_UTILIZATION,
+            DEFAULT_LOCAL_RETRIEVAL_GPU_MEMORY_UTILIZATION - embedding_gpu_memory,
+        )
+    if embedding_gpu_memory is None:
+        embedding_gpu_memory = max(
+            MIN_LOCAL_RETRIEVAL_GPU_MEMORY_UTILIZATION,
+            DEFAULT_LOCAL_RETRIEVAL_GPU_MEMORY_UTILIZATION - agent_gpu_memory,
+        )
+    return agent_gpu_memory, embedding_gpu_memory
+
+
+def effective_agent_gpu_memory_utilization(args: argparse.Namespace) -> float:
+    if args.non_local_agent:
+        raise ValueError("agent GPU memory utilization only applies to local planners")
+    agent_gpu_memory, _ = effective_local_retrieval_gpu_memory_utilizations(args)
+    return agent_gpu_memory
+
+
+def effective_embedding_gpu_memory_utilization(args: argparse.Namespace) -> float | None:
+    if args.non_local_agent:
+        return args.embedding_gpu_memory_utilization
+    _, embedding_gpu_memory = effective_local_retrieval_gpu_memory_utilizations(args)
+    return embedding_gpu_memory
+
+
+def effective_answer_gpu_memory_utilization(args: argparse.Namespace) -> float:
+    if args.gpu_memory_utilization is not None:
+        return args.gpu_memory_utilization
+    return DEFAULT_LOCAL_ANSWER_GPU_MEMORY_UTILIZATION
+
+
+def format_gpu_memory_utilization(value: float | None) -> str:
+    return "vLLM default" if value is None else f"{value:.3f}"
+
+
+def release_cuda_memory() -> None:
+    gc.collect()
+    if not torch.cuda.is_available():
+        return
+    torch.cuda.empty_cache()
+    try:
+        torch.cuda.ipc_collect()
+    except Exception:
+        logger.debug("Could not run torch.cuda.ipc_collect()", exc_info=True)
 
 
 def render_agent_template(
@@ -840,7 +942,7 @@ def build_agentic_query_planner(args: argparse.Namespace) -> QueryPlanner:
         agent_model,
         tensor_parallel_size=args.agent_tensor_parallel_size,
         max_model_len=args.agent_max_model_len,
-        gpu_memory_utilization=args.agent_gpu_memory_utilization,
+        gpu_memory_utilization=effective_agent_gpu_memory_utilization(args),
         dtype=args.agent_dtype,
         trust_remote_code=args.agent_trust_remote_code,
         distributed_executor_backend=args.agent_distributed_executor_backend,
@@ -989,6 +1091,9 @@ def run_agentic_retrieval_for_question(
         "agent_non_local": bool(args.non_local_agent),
         "agent_provider": planner.provider_name,
         "agent_model": planner.model_name,
+        "agent_gpu_memory_utilization": (
+            None if args.non_local_agent else effective_agent_gpu_memory_utilization(args)
+        ),
         "agent_max_iterations": args.max_iterations,
         "agent_planner_search_budget": PLANNER_SEARCH_BUDGET,
         "agent_num_searches": len(search_steps),
@@ -1001,6 +1106,7 @@ def run_agentic_retrieval_for_question(
         "agent_search_steps": search_steps,
         "gold_and_support_only": bool(args.gold_and_support_only),
         "retrieval_model": args.embedding_model_name_or_path,
+        "embedding_gpu_memory_utilization": effective_embedding_gpu_memory_utilization(args),
         "embedding_dim": args.embedding_dim,
         "normalized": bool(args.normalize),
         "documents": [
@@ -1026,13 +1132,26 @@ def run_agentic_retrieval(args: argparse.Namespace) -> list[dict[str, Any]]:
     embedding_model: Qwen3EmbeddingVllm | None = None
     records: list[dict[str, Any]] = []
     try:
+        if args.non_local_agent:
+            logger.info(
+                "Using %s planner and embedding vLLM GPU memory utilization=%s",
+                args.agent_provider,
+                format_gpu_memory_utilization(effective_embedding_gpu_memory_utilization(args)),
+            )
+        else:
+            agent_gpu_memory, embedding_gpu_memory = effective_local_retrieval_gpu_memory_utilizations(args)
+            logger.info(
+                "Using local retrieval vLLM GPU memory utilizations: planner=%.3f, embedding=%.3f",
+                agent_gpu_memory,
+                embedding_gpu_memory,
+            )
         planner = build_agentic_query_planner(args)
         embedding_model = Qwen3EmbeddingVllm(
             args.embedding_model_name_or_path,
             instruction=args.embedding_instruction,
             tensor_parallel_size=args.embedding_tensor_parallel_size,
             max_model_len=args.embedding_max_model_len,
-            gpu_memory_utilization=args.embedding_gpu_memory_utilization,
+            gpu_memory_utilization=effective_embedding_gpu_memory_utilization(args),
         )
         assert planner is not None
         assert embedding_model is not None
@@ -1065,19 +1184,24 @@ def run_agentic_retrieval(args: argparse.Namespace) -> list[dict[str, Any]]:
                     "agent_non_local": bool(args.non_local_agent),
                     "agent_provider": planner.provider_name,
                     "agent_model": planner.model_name,
+                    "agent_gpu_memory_utilization": (
+                        None if args.non_local_agent else effective_agent_gpu_memory_utilization(args)
+                    ),
                     "gold_and_support_only": bool(args.gold_and_support_only),
                     "error": str(exc),
+                    "retrieval_model": args.embedding_model_name_or_path,
+                    "embedding_gpu_memory_utilization": effective_embedding_gpu_memory_utilization(args),
                     "documents": [],
                 }
             records.append(record)
     finally:
         if planner is not None:
             stop_component("agent planner", planner)
+            planner = None
         if embedding_model is not None:
             stop_component("embedding model", embedding_model)
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            embedding_model = None
+        release_cuda_memory()
 
     write_jsonl(records, args.retrieval_output_path)
     logger.info("Wrote %d agentic retrieval records to %s", len(records), args.retrieval_output_path)
@@ -1100,7 +1224,7 @@ def build_answer_args(args: argparse.Namespace) -> argparse.Namespace:
         max_model_len=args.max_model_len,
         max_prompt_tokens=args.max_prompt_tokens,
         max_new_tokens=args.max_new_tokens,
-        gpu_memory_utilization=args.gpu_memory_utilization,
+        gpu_memory_utilization=effective_answer_gpu_memory_utilization(args),
         dtype=args.dtype,
         trust_remote_code=args.trust_remote_code,
         temperature=args.temperature,
@@ -1131,7 +1255,17 @@ def run_agentic_rag(args: argparse.Namespace) -> tuple[list[dict[str, Any]], lis
     retrieval_records = run_agentic_retrieval(args)
     answer_output_records: list[dict[str, Any]] = []
     if not args.skip_answer:
-        answer_output_records = answer_records(build_answer_args(args))
+        if args.non_local_answerer:
+            logger.info("Using %s answerer", args.provider)
+        else:
+            logger.info(
+                "Using local answerer vLLM GPU memory utilization=%.3f",
+                effective_answer_gpu_memory_utilization(args),
+            )
+        try:
+            answer_output_records = answer_records(build_answer_args(args))
+        finally:
+            release_cuda_memory()
     return retrieval_records, answer_output_records
 
 

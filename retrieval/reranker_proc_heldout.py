@@ -24,7 +24,6 @@ try:
         DEFAULT_DOCS_DIR,
         DEFAULT_QUESTIONS_PATH,
         DEFAULT_PRIVILEGED_DIR,
-        DEFAULT_GOLD_AND_SUPPORT_ONLY,
         CandidateDocument,
         Qwen3EmbeddingVllm,
         RetrievedDocument,
@@ -42,7 +41,6 @@ except ModuleNotFoundError as exc:
         DEFAULT_DOCS_DIR,
         DEFAULT_QUESTIONS_PATH,
         DEFAULT_PRIVILEGED_DIR,
-        DEFAULT_GOLD_AND_SUPPORT_ONLY,
         CandidateDocument,
         Qwen3EmbeddingVllm,
         RetrievedDocument,
@@ -58,7 +56,8 @@ except ModuleNotFoundError as exc:
 logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_retrieval_reranked_supponly.jsonl"
+DEFAULT_GOLD_AND_SUPPORT_ONLY=False
+DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_retrieval_reranked.jsonl"
 
 
 def normalize_token_ids(tokenized: Any) -> list[int]:
@@ -236,7 +235,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reranker-gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--reranker-distributed-executor-backend", default=None)
 
-    parser.add_argument("--retrieval-top-k", type=int, default=10)
+    parser.add_argument("--retrieval-top-k", type=int, default=20)
     parser.add_argument("--rerank-top-k", type=int, default=5)
     parser.add_argument("--max-doc-chars", type=int, default=30_000)
     parser.add_argument(

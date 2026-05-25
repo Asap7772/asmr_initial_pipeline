@@ -58,9 +58,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_answers_supponly_gemini.jsonl"
 # DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_answers_supponly_qwen.jsonl"
 
-DEFAULT_INPUT_PATH = REPO_ROOT / "retrieval" / "heldout_retrieval_reranked_supponly.jsonl"
-# DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_answers_reranked_supponly_qwen.jsonl"
-DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_answers_reranked_supponly_gemini.jsonl"
+# DEFAULT_INPUT_PATH = REPO_ROOT / "retrieval" / "heldout_retrieval_hybrid.jsonl"
+# DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_answers_hybrid_qwen.jsonl"
+
+DEFAULT_INPUT_PATH = REPO_ROOT / "retrieval" / "heldout_retrieval.jsonl"
+DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_answers_gemini.jsonl"
+
+# DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_answers_hybrid_gemini.jsonl"
 DEFAULT_NON_LOCAL_ANSWERER=True
 DEFAULT_LOCAL_MODEL = "Qwen/Qwen3.5-4B"
 

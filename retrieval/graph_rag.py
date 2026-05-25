@@ -89,13 +89,16 @@ except ModuleNotFoundError as exc:
 logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_RETRIEVAL_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_graph_retrieval_qwen.jsonl"
-DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_graph_answers_qwen.jsonl"
+DEFAULT_RETRIEVAL_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_graph_retrieval_gemini.jsonl"
+DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_graph_answers_gemini.jsonl"
 DEFAULT_GOLD_AND_SUPPORT_ONLY = False
 DEFAULT_MAX_INDEX_DOCS = 0
 FORCE_FULL_DOCUMENT_CORPUS = True
-DEFAULT_NON_LOCAL_GRAPH = False
-DEFAULT_NON_LOCAL_ANSWERER = False
+DEFAULT_NON_LOCAL_GRAPH = True
+DEFAULT_NON_LOCAL_ANSWERER = True
+DEFAULT_LOCAL_GRAPH_GPU_MEMORY_UTILIZATION = 0.9
+DEFAULT_LOCAL_ANSWER_GPU_MEMORY_UTILIZATION = 0.9
+DEFAULT_LOCAL_GRAPH_MAX_MODEL_LEN = 8192
 
 PROMPT_SOURCE_URLS = [
     "https://github.com/microsoft/graphrag/tree/main/packages/graphrag/graphrag/prompts/index",
@@ -388,8 +391,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--graph-batch-size", type=int, default=8)
     parser.add_argument("--graph-tensor-parallel-size", type=int, default=None)
     parser.add_argument("--graph-distributed-executor-backend", default=None)
-    parser.add_argument("--graph-max-model-len", type=int, default=32768)
-    parser.add_argument("--graph-gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--graph-max-model-len", type=int, default=DEFAULT_LOCAL_GRAPH_MAX_MODEL_LEN)
+    parser.add_argument(
+        "--graph-gpu-memory-utilization",
+        type=float,
+        default=None,
+        help=(
+            "GPU memory fraction for local graph-generator vLLM. Defaults to "
+            f"{DEFAULT_LOCAL_GRAPH_GPU_MEMORY_UTILIZATION}."
+        ),
+    )
     parser.add_argument("--graph-dtype", default="auto")
     parser.add_argument("--graph-trust-remote-code", action="store_true")
     parser.add_argument("--graph-temperature", type=float, default=0.0)
@@ -456,7 +467,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, default=32768)
     parser.add_argument("--max-prompt-tokens", type=int, default=30000)
     parser.add_argument("--max-new-tokens", type=int, default=128)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=None,
+        help=(
+            "GPU memory fraction for the local answerer vLLM. Defaults to "
+            f"{DEFAULT_LOCAL_ANSWER_GPU_MEMORY_UTILIZATION}."
+        ),
+    )
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -490,6 +509,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("--graph-batch-size must be at least 1")
     if not args.non_local_graph and args.graph_max_model_len <= args.graph_max_completion_tokens:
         parser.error("--graph-max-model-len must be greater than --graph-max-completion-tokens")
+    for option_name in (
+        "graph_gpu_memory_utilization",
+        "embedding_gpu_memory_utilization",
+        "gpu_memory_utilization",
+    ):
+        value = getattr(args, option_name)
+        if value is not None and not (0.0 < value <= 1.0):
+            parser.error(f"--{option_name.replace('_', '-')} must be in (0, 1]")
     if args.chunk_chars < 100:
         parser.error("--chunk-chars must be at least 100")
     if args.chunk_overlap < 0:
@@ -537,6 +564,31 @@ def enforce_full_document_corpus(args: argparse.Namespace) -> None:
     if FORCE_FULL_DOCUMENT_CORPUS:
         args.gold_and_support_only = False
         args.max_index_docs = 0
+
+
+def effective_graph_gpu_memory_utilization(args: argparse.Namespace) -> float:
+    if args.non_local_graph:
+        raise ValueError("graph GPU memory utilization only applies to local graph generators")
+    if args.graph_gpu_memory_utilization is not None:
+        return args.graph_gpu_memory_utilization
+    return DEFAULT_LOCAL_GRAPH_GPU_MEMORY_UTILIZATION
+
+
+def effective_answer_gpu_memory_utilization(args: argparse.Namespace) -> float:
+    if args.gpu_memory_utilization is not None:
+        return args.gpu_memory_utilization
+    return DEFAULT_LOCAL_ANSWER_GPU_MEMORY_UTILIZATION
+
+
+def release_cuda_memory() -> None:
+    gc.collect()
+    if not torch.cuda.is_available():
+        return
+    torch.cuda.empty_cache()
+    try:
+        torch.cuda.ipc_collect()
+    except Exception:
+        logger.debug("Could not run torch.cuda.ipc_collect()", exc_info=True)
 
 
 def compact_whitespace(text: str) -> str:
@@ -1393,6 +1445,9 @@ def run_graph_retrieval_for_question(
         "graph_non_local": bool(args.non_local_graph),
         "graph_provider": generator.provider_name,
         "graph_model": generator.model_name,
+        "graph_gpu_memory_utilization": (
+            None if args.non_local_graph else effective_graph_gpu_memory_utilization(args)
+        ),
         "graph_num_text_units": len(text_units),
         "graph_num_entities": len(graph.entities),
         "graph_num_relationships": len(graph.relationships),
@@ -1435,7 +1490,7 @@ def build_graph_generator(args: argparse.Namespace) -> GraphGenerator:
         graph_model,
         tensor_parallel_size=args.graph_tensor_parallel_size,
         max_model_len=args.graph_max_model_len,
-        gpu_memory_utilization=args.graph_gpu_memory_utilization,
+        gpu_memory_utilization=effective_graph_gpu_memory_utilization(args),
         dtype=args.graph_dtype,
         trust_remote_code=args.graph_trust_remote_code,
         distributed_executor_backend=args.graph_distributed_executor_backend,
@@ -1462,6 +1517,13 @@ def run_graph_retrieval(args: argparse.Namespace) -> list[dict[str, Any]]:
     generator: GraphGenerator | None = None
     records: list[dict[str, Any]] = []
     try:
+        if args.non_local_graph:
+            logger.info("Using %s graph generator", args.graph_provider)
+        else:
+            logger.info(
+                "Using local graph-generator vLLM GPU memory utilization=%.3f",
+                effective_graph_gpu_memory_utilization(args),
+            )
         generator = build_graph_generator(args)
         assert generator is not None
 
@@ -1495,6 +1557,9 @@ def run_graph_retrieval(args: argparse.Namespace) -> list[dict[str, Any]]:
                     "graph_non_local": bool(args.non_local_graph),
                     "graph_provider": generator.provider_name,
                     "graph_model": generator.model_name,
+                    "graph_gpu_memory_utilization": (
+                        None if args.non_local_graph else effective_graph_gpu_memory_utilization(args)
+                    ),
                     "gold_and_support_only": bool(args.gold_and_support_only),
                     "error": str(exc),
                     "documents": [],
@@ -1503,9 +1568,8 @@ def run_graph_retrieval(args: argparse.Namespace) -> list[dict[str, Any]]:
     finally:
         if generator is not None:
             stop_component("graph generator", generator)
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            generator = None
+        release_cuda_memory()
 
     write_jsonl(records, args.retrieval_output_path)
     logger.info("Wrote %d GraphRAG retrieval records to %s", len(records), args.retrieval_output_path)
@@ -1528,7 +1592,7 @@ def build_answer_args(args: argparse.Namespace) -> argparse.Namespace:
         max_model_len=args.max_model_len,
         max_prompt_tokens=args.max_prompt_tokens,
         max_new_tokens=args.max_new_tokens,
-        gpu_memory_utilization=args.gpu_memory_utilization,
+        gpu_memory_utilization=effective_answer_gpu_memory_utilization(args),
         dtype=args.dtype,
         trust_remote_code=args.trust_remote_code,
         temperature=args.temperature,
@@ -1559,7 +1623,17 @@ def run_graph_rag(args: argparse.Namespace) -> tuple[list[dict[str, Any]], list[
     retrieval_records = run_graph_retrieval(args)
     answer_output_records: list[dict[str, Any]] = []
     if not args.skip_answer:
-        answer_output_records = answer_records(build_answer_args(args))
+        if args.non_local_answerer:
+            logger.info("Using %s answerer", args.provider)
+        else:
+            logger.info(
+                "Using local answerer vLLM GPU memory utilization=%.3f",
+                effective_answer_gpu_memory_utilization(args),
+            )
+        try:
+            answer_output_records = answer_records(build_answer_args(args))
+        finally:
+            release_cuda_memory()
     return retrieval_records, answer_output_records
 
 

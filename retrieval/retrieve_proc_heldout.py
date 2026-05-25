@@ -22,9 +22,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_QUESTIONS_PATH = REPO_ROOT / "data" / "heldout_50_questions.json"
 DEFAULT_DOCS_DIR = REPO_ROOT / "data" / "train"
 DEFAULT_PRIVILEGED_DIR = REPO_ROOT / "data" / "train_privileged"
-DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_retrieval_supponly.jsonl"
+DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_retrieval.jsonl"
 GOLD_AND_SUPPORT_LABELS = frozenset({"gold_docs", "evidence_docs", "support_docs", "supporting_docs"})
-DEFAULT_GOLD_AND_SUPPORT_ONLY=True
+DEFAULT_GOLD_AND_SUPPORT_ONLY=False
 
 @dataclass(frozen=True)
 class CandidateDocument:
