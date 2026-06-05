@@ -61,11 +61,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # DEFAULT_INPUT_PATH = REPO_ROOT / "retrieval" / "heldout_retrieval_hybrid.jsonl"
 # DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_answers_hybrid_qwen.jsonl"
 
-DEFAULT_INPUT_PATH = REPO_ROOT / "retrieval" / "heldout_retrieval.jsonl"
-DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_answers_gemini.jsonl"
+DEFAULT_INPUT_PATH = REPO_ROOT / "retrieval" / "heldout_retrieval_reason_moderncolbert.jsonl"
+DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_answers_moderncolbert_qwen.jsonl"
 
 # DEFAULT_OUTPUT_PATH = REPO_ROOT / "retrieval" / "heldout_answers_hybrid_gemini.jsonl"
-DEFAULT_NON_LOCAL_ANSWERER=True
+DEFAULT_NON_LOCAL_ANSWERER=False
 DEFAULT_LOCAL_MODEL = "Qwen/Qwen3.5-4B"
 
 SYSTEM_PROMPT = """You answer questions using only the retrieved documents provided.

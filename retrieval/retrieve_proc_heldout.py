@@ -12,8 +12,6 @@ from typing import Any, Iterable, Union
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-from vllm import LLM, PoolingParams
-from vllm.distributed.parallel_state import destroy_distributed_environment, destroy_model_parallel
 
 
 logger = logging.getLogger(__name__)
@@ -50,6 +48,8 @@ def build_embedding_llm_kwargs(
     max_model_len: int | None,
     gpu_memory_utilization: float | None,
 ) -> dict[str, Any]:
+    from vllm import LLM
+
     llm_signature = inspect.signature(LLM)
     llm_kwargs: dict[str, Any] = {
         "model": model_name_or_path,
@@ -85,6 +85,8 @@ class Qwen3EmbeddingVllm:
             instruction = "Given a web search query, retrieve relevant passages that answer the query"
         self.instruction = instruction
 
+        from vllm import LLM
+
         self.model = LLM(
             **build_embedding_llm_kwargs(
                 model_name_or_path,
@@ -111,12 +113,16 @@ class Qwen3EmbeddingVllm:
         if is_query:
             sentences = [self.get_detailed_instruct(instruction, sent) for sent in sentences]
         if dim > 0:
+            from vllm import PoolingParams
+
             output = self.model.embed(sentences, pooling_params=PoolingParams(dimensions=dim))
         else:
             output = self.model.embed(sentences)
         return torch.tensor([o.outputs.embedding for o in output])
 
     def stop(self) -> None:
+        from vllm.distributed.parallel_state import destroy_distributed_environment, destroy_model_parallel
+
         destroy_model_parallel()
         destroy_distributed_environment()
 

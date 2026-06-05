@@ -12,11 +12,13 @@ This repository contains private benchmark data and generated artifacts. Treat `
 - `inference/collect_llm.py`: provider-agnostic async LLM client helpers with prompt caching.
 - `proc_bright.py`: builds BRIGHT gold/negative filesystem tasks under `data/bright`.
 - `retrieval/retrieve_proc_heldout.py`: retrieves documents with Qwen embedding models through vLLM.
+- `retrieval/retrieve_proc_heldout_moderncolbert.py`: retrieves documents with LightOn Reason-ModernColBERT through PyLate.
 - `retrieval/reranker_proc_heldout.py`: retrieves then reranks with a Qwen reranker through vLLM.
 - `retrieval/answer_proc_heldout.py`: answers retrieved/reranked records and optionally judges against gold answers.
 - `modal_launch_vllm.py`: configurable Modal vLLM deployment entrypoint.
 - `modal_launch_vllm_qwen35_35b_a3b_long_context.py`: Modal deployment for Qwen3.5-35B-A3B with a 262k-token context.
 - `deploy_qwen35_35b_a3b_long_context_262k.sh`: convenience wrapper for the long-context Modal deployment.
+- `arxiv_paper/`: arXiv and Hugging Face Paper Pages citation graph builders. See `arxiv_paper/README.md`.
 - `prompts/`: prompt templates for cluster-bank and best-of-many workflows.
 - `tinker_synthetic_fs_current/`: Tinker synthetic filesystem RL package. See its local README for detailed training and evaluation commands.
 - `tinker_runs/`: local run outputs, logs, metrics, configs, code diffs, and checkpoints.
@@ -29,6 +31,7 @@ Start from a Python environment with GPU/CUDA support when using vLLM:
 python -m venv .venv
 source .venv/bin/activate
 pip install datasets pandas tqdm openai torch transformers vllm modal
+pip install pylate
 ```
 
 Copy the environment template and fill in only the services you use:
@@ -137,6 +140,17 @@ python -m retrieval.retrieve_proc_heldout \
   --privileged-dir data/train_privileged \
   --top-k 5 \
   --output-path retrieval/heldout_retrieval_supponly.jsonl
+```
+
+Reason-ModernColBERT late-interaction retrieval:
+
+```bash
+python -m retrieval.retrieve_proc_heldout_moderncolbert \
+  --questions-path data/heldout_50_questions.json \
+  --docs-dir data/train \
+  --privileged-dir data/train_privileged \
+  --top-k 5 \
+  --output-path retrieval/heldout_retrieval_reason_moderncolbert.jsonl
 ```
 
 Retrieve then rerank:
