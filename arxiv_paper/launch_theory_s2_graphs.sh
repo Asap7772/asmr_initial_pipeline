@@ -26,6 +26,26 @@ S2_PUBLICATION_TYPES="${S2_PUBLICATION_TYPES:-}"
 MIN_YEAR="${MIN_YEAR:-}"
 MAX_YEAR="${MAX_YEAR:-}"
 ALLOW_MISSING_S2_KEY="${ALLOW_MISSING_S2_KEY:-0}"
+CONTINUE_ON_ERROR="${CONTINUE_ON_ERROR:-1}"
+FALLBACK_ON_FAILURE="${FALLBACK_ON_FAILURE:-1}"
+FAILURE_LOG="${FAILURE_LOG:-$OUTPUT_ROOT/failed_domains.tsv}"
+SUCCESS_LOG="${SUCCESS_LOG:-$OUTPUT_ROOT/succeeded_domains.tsv}"
+
+broaden_query() {
+  local query="$1"
+  query="${query// lower bounds/}"
+  query="${query// guarantees/}"
+  query="${query// convergence/}"
+  query="${query// complexity/}"
+  query="${query// theory/}"
+  query="${query// algorithms/}"
+  query="${query// models/}"
+  query="${query// systems/}"
+  query="${query//  / }"
+  query="${query#"${query%%[![:space:]]*}"}"
+  query="${query%"${query##*[![:space:]]}"}"
+  printf "%s" "$query"
+}
 
 # Mostly theoretical seed domains, chosen to resemble arXiv theory-heavy
 # subject areas rather than empirical/application-first areas. Each row is:
@@ -41,7 +61,7 @@ THEORY_DOMAINS=(
   "approximation_algorithms|approximation algorithms hardness of approximation|Computer Science"
   "sublinear_algorithms|sublinear algorithms streaming algorithms property testing|Computer Science"
   "computational_geometry|computational geometry discrete geometry algorithms|Computer Science"
-  "distributed_computing_theory|distributed computing theory consensus lower bounds|Computer Science"
+  "distributed_computing_theory|distributed computing consensus fault tolerance|Computer Science"
   "parallel_algorithms|parallel algorithms parallel complexity|Computer Science"
   "database_theory|database theory finite model theory query languages|Computer Science"
   "algorithmic_game_theory|algorithmic game theory mechanism design equilibria|Computer Science"
@@ -191,6 +211,8 @@ base_quota="$((TARGET_TOTAL / domain_count))"
 remainder="$((TARGET_TOTAL % domain_count))"
 
 mkdir -p "$OUTPUT_ROOT"
+: > "$SUCCESS_LOG"
+: > "$FAILURE_LOG"
 
 echo "Writing theoretical S2-search citation graphs under: $OUTPUT_ROOT"
 echo "Target seed papers: $TARGET_TOTAL across $domain_count domains"
@@ -199,7 +221,61 @@ echo "Max candidates per domain: $MAX_CANDIDATES"
 echo "S2 search: batch_size=$S2_SEARCH_BATCH_SIZE max_pages=$S2_SEARCH_MAX_PAGES sort=$S2_SEARCH_SORT"
 echo "S2 batch: batch_size=$S2_BATCH_SIZE concurrency=$S2_CONCURRENCY sleep=${S2_SLEEP}s"
 echo "Skip existing: $SKIP_EXISTING; dry run: $DRY_RUN"
+echo "Continue on error: $CONTINUE_ON_ERROR; fallback on failure: $FALLBACK_ON_FAILURE"
 echo "Extra builder args: $*"
+
+run_domain() {
+  local slug="$1"
+  local query="$2"
+  local fields_of_study="$3"
+  local quota="$4"
+  local output_dir="$5"
+  shift 5
+
+  local cmd=(
+    "$PYTHON" arxiv_paper/build_arxiv_citation_graph.py
+    --candidate-source s2-search
+    --query "$query"
+    --s2-search-query "$query"
+    --s2-search-sort "$S2_SEARCH_SORT"
+    --s2-search-batch-size "$S2_SEARCH_BATCH_SIZE"
+    --s2-search-max-pages "$S2_SEARCH_MAX_PAGES"
+    --max-arxiv-results "$MAX_CANDIDATES"
+    --min-citations "$MIN_CITATIONS"
+    --max-seed-papers "$quota"
+    --s2-batch-size "$S2_BATCH_SIZE"
+    --s2-concurrency "$S2_CONCURRENCY"
+    --s2-sleep "$S2_SLEEP"
+    --max-retries "$MAX_RETRIES"
+    --env-path "$ENV_PATH"
+    --output-dir "$output_dir"
+  )
+
+  if [[ -n "$fields_of_study" ]]; then
+    cmd+=(--s2-fields-of-study "$fields_of_study")
+  fi
+  if [[ -n "$S2_PUBLICATION_TYPES" ]]; then
+    cmd+=(--s2-publication-types "$S2_PUBLICATION_TYPES")
+  fi
+  if [[ -n "$MIN_YEAR" ]]; then
+    cmd+=(--min-year "$MIN_YEAR")
+  fi
+  if [[ -n "$MAX_YEAR" ]]; then
+    cmd+=(--max-year "$MAX_YEAR")
+  fi
+  if [[ "$ALLOW_MISSING_S2_KEY" == "1" ]]; then
+    cmd+=(--allow-missing-s2-key)
+  fi
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf "Command:"
+    printf " %q" "${cmd[@]}" "$@"
+    printf "\n"
+    return 0
+  fi
+
+  "${cmd[@]}" "$@"
+}
 
 for idx in "${!SELECTED_DOMAINS[@]}"; do
   IFS="|" read -r slug query fields_of_study <<< "${SELECTED_DOMAINS[$idx]}"
@@ -217,52 +293,50 @@ for idx in "${!SELECTED_DOMAINS[@]}"; do
     continue
   fi
 
-  cmd=(
-    "$PYTHON" arxiv_paper/build_arxiv_citation_graph.py
-    --candidate-source s2-search
-    --query "$query"
-    --s2-search-query "$query"
-    --s2-fields-of-study "$fields_of_study"
-    --s2-search-sort "$S2_SEARCH_SORT"
-    --s2-search-batch-size "$S2_SEARCH_BATCH_SIZE"
-    --s2-search-max-pages "$S2_SEARCH_MAX_PAGES"
-    --max-arxiv-results "$MAX_CANDIDATES"
-    --min-citations "$MIN_CITATIONS"
-    --max-seed-papers "$quota"
-    --s2-batch-size "$S2_BATCH_SIZE"
-    --s2-concurrency "$S2_CONCURRENCY"
-    --s2-sleep "$S2_SLEEP"
-    --max-retries "$MAX_RETRIES"
-    --env-path "$ENV_PATH"
-    --output-dir "$output_dir"
-  )
-
-  if [[ -n "$S2_PUBLICATION_TYPES" ]]; then
-    cmd+=(--s2-publication-types "$S2_PUBLICATION_TYPES")
-  fi
-  if [[ -n "$MIN_YEAR" ]]; then
-    cmd+=(--min-year "$MIN_YEAR")
-  fi
-  if [[ -n "$MAX_YEAR" ]]; then
-    cmd+=(--max-year "$MAX_YEAR")
-  fi
-  if [[ "$ALLOW_MISSING_S2_KEY" == "1" ]]; then
-    cmd+=(--allow-missing-s2-key)
-  fi
-
   echo
   echo "[$((idx + 1))/$domain_count] $slug -> quota $quota"
   echo "Query: $query"
   echo "Fields: $fields_of_study"
 
-  if [[ "$DRY_RUN" == "1" ]]; then
-    printf "Command:"
-    printf " %q" "${cmd[@]}" "$@"
-    printf "\n"
+  if run_domain "$slug" "$query" "$fields_of_study" "$quota" "$output_dir" "$@"; then
+    printf "%s\t%s\t%s\n" "$slug" "$query" "$output_dir" >> "$SUCCESS_LOG"
+    continue
+  fi
+
+  retry_status=1
+  if [[ "$FALLBACK_ON_FAILURE" == "1" ]]; then
+    fallback_query="$(broaden_query "$query")"
+    if [[ -z "$fallback_query" || "$fallback_query" == "$query" ]]; then
+      fallback_query="${slug//_/ }"
+    fi
+
+    echo "Primary run failed for $slug; retrying with broader query: $fallback_query"
+    if run_domain "$slug" "$fallback_query" "$fields_of_study" "$quota" "$output_dir" "$@"; then
+      printf "%s\t%s\t%s\tfallback_query\n" "$slug" "$fallback_query" "$output_dir" >> "$SUCCESS_LOG"
+      retry_status=0
+    else
+      echo "Field-filtered fallback failed for $slug; retrying without fields"
+      if run_domain "$slug" "$fallback_query" "" "$quota" "$output_dir" "$@"; then
+        printf "%s\t%s\t%s\tfallback_no_fields\n" "$slug" "$fallback_query" "$output_dir" >> "$SUCCESS_LOG"
+        retry_status=0
+      fi
+    fi
+  fi
+
+  if [[ "$retry_status" == "0" ]]; then
+    continue
+  fi
+
+  printf "%s\t%s\t%s\n" "$slug" "$query" "$output_dir" >> "$FAILURE_LOG"
+  if [[ "$CONTINUE_ON_ERROR" == "1" ]]; then
+    echo "Continuing after failed domain: $slug"
   else
-    "${cmd[@]}" "$@"
+    echo "Stopping after failed domain: $slug" >&2
+    exit 1
   fi
 done
 
 echo
 echo "Done. Per-domain manifests are in $OUTPUT_ROOT/*/manifest.json"
+echo "Success log: $SUCCESS_LOG"
+echo "Failure log: $FAILURE_LOG"

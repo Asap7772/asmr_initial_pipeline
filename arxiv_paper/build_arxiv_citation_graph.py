@@ -372,6 +372,55 @@ def parse_args() -> argparse.Namespace:
         help="Maximum number of well-cited arXiv seed papers to keep.",
     )
     parser.add_argument(
+        "--seed-include-keywords",
+        default=None,
+        help=(
+            "Comma-separated title/abstract keywords. If set, a seed paper "
+            "must match at least one keyword or phrase."
+        ),
+    )
+    parser.add_argument(
+        "--seed-exclude-keywords",
+        default=None,
+        help=(
+            "Comma-separated title/abstract keywords. If set, a seed paper "
+            "matching any keyword or phrase is skipped."
+        ),
+    )
+    parser.add_argument(
+        "--seed-publication-types",
+        default=None,
+        help=(
+            "Comma-separated Semantic Scholar publicationTypes required for "
+            "seed papers after enrichment, e.g. 'Conference,JournalArticle'."
+        ),
+    )
+    parser.add_argument(
+        "--require-seed-publication",
+        action="store_true",
+        help=(
+            "Require seed papers to have a Semantic Scholar publication signal "
+            "such as a non-arXiv venue, non-preprint publication type, or DOI."
+        ),
+    )
+    parser.add_argument(
+        "--reference-include-keywords",
+        default=None,
+        help=(
+            "Comma-separated title/abstract keywords. If set, a referenced "
+            "paper must match at least one keyword or phrase before being "
+            "added or expanded."
+        ),
+    )
+    parser.add_argument(
+        "--reference-exclude-keywords",
+        default=None,
+        help=(
+            "Comma-separated title/abstract keywords. If set, referenced "
+            "papers matching any keyword or phrase are skipped."
+        ),
+    )
+    parser.add_argument(
         "--graph-size-preset",
         choices=["none", "domain-10k"],
         default="none",
@@ -688,6 +737,42 @@ def split_csv_option(value: str | None) -> list[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
+def normalize_keyword_text(value: Any) -> str:
+    cleaned = clean_text(value)
+    if not cleaned:
+        return ""
+    return " ".join(re.sub(r"[^A-Za-z0-9]+", " ", cleaned.lower()).split())
+
+
+def keyword_matches_text(keyword: str, normalized_text: str) -> bool:
+    normalized_keyword = normalize_keyword_text(keyword)
+    return bool(normalized_keyword and normalized_keyword in normalized_text)
+
+
+def paper_seed_filter_text(
+    entry: dict[str, Any],
+    paper: dict[str, Any],
+) -> str:
+    parts = [
+        paper.get("title"),
+        paper.get("abstract"),
+        entry.get("title"),
+        entry.get("summary"),
+    ]
+    return normalize_keyword_text(" ".join(str(part) for part in parts if part))
+
+
+def paper_matches_any_seed_keyword(
+    entry: dict[str, Any],
+    paper: dict[str, Any],
+    keywords: list[str],
+) -> bool:
+    if not keywords:
+        return False
+    normalized_text = paper_seed_filter_text(entry, paper)
+    return any(keyword_matches_text(keyword, normalized_text) for keyword in keywords)
+
+
 def external_id_from_mapping(external_ids: Any, name: str) -> str | None:
     if not isinstance(external_ids, dict):
         return None
@@ -695,6 +780,55 @@ def external_id_from_mapping(external_ids: Any, name: str) -> str | None:
         if key.lower() == name.lower() and value:
             return str(value)
     return None
+
+
+def paper_publication_types(paper: dict[str, Any]) -> list[str]:
+    raw_types = paper.get("publicationTypes")
+    if isinstance(raw_types, list):
+        return [str(value) for value in raw_types if value]
+    if isinstance(raw_types, str):
+        return split_csv_option(raw_types)
+    return []
+
+
+def normalize_publication_type(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def paper_matches_publication_types(
+    paper: dict[str, Any],
+    publication_types: list[str],
+) -> bool:
+    requested_types = {
+        normalize_publication_type(publication_type)
+        for publication_type in publication_types
+        if publication_type
+    }
+    if not requested_types:
+        return True
+
+    paper_types = {
+        normalize_publication_type(publication_type)
+        for publication_type in paper_publication_types(paper)
+        if publication_type
+    }
+    return bool(requested_types & paper_types)
+
+
+def paper_has_publication_signal(paper: dict[str, Any]) -> bool:
+    venue = clean_text(paper.get("venue"))
+    if venue and normalize_keyword_text(venue) not in {"arxiv", "arxiv org"}:
+        return True
+
+    publication_types = {
+        normalize_publication_type(publication_type)
+        for publication_type in paper_publication_types(paper)
+        if publication_type
+    }
+    if publication_types - {"preprint"}:
+        return True
+
+    return bool(external_id_from_mapping(paper.get("externalIds"), "doi"))
 
 
 def derive_s2_search_query(arxiv_query: str) -> str:
@@ -1927,6 +2061,13 @@ def select_seed_papers(
     below_min_citations = 0
     below_min_year = 0
     above_max_year = 0
+    missing_publication_signal = 0
+    missing_publication_type = 0
+    missing_include_keywords = 0
+    excluded_keywords = 0
+    seed_publication_types = split_csv_option(args.seed_publication_types)
+    include_keywords = split_csv_option(args.seed_include_keywords)
+    exclude_keywords = split_csv_option(args.seed_exclude_keywords)
     for entry in candidates:
         requested_id = f"ARXIV:{entry['arxiv_id']}"
         paper = s2_papers.get(requested_id)
@@ -1947,6 +2088,33 @@ def select_seed_papers(
             above_max_year += 1
             continue
 
+        if args.require_seed_publication and not paper_has_publication_signal(paper):
+            missing_publication_signal += 1
+            continue
+
+        if seed_publication_types and not paper_matches_publication_types(
+            paper,
+            seed_publication_types,
+        ):
+            missing_publication_type += 1
+            continue
+
+        if include_keywords and not paper_matches_any_seed_keyword(
+            entry,
+            paper,
+            include_keywords,
+        ):
+            missing_include_keywords += 1
+            continue
+
+        if exclude_keywords and paper_matches_any_seed_keyword(
+            entry,
+            paper,
+            exclude_keywords,
+        ):
+            excluded_keywords += 1
+            continue
+
         selected.append((entry, paper))
 
     eligible_count = len(selected)
@@ -1965,7 +2133,11 @@ def select_seed_papers(
         f"eligible={eligible_count:,}, selected={len(selected):,}, "
         f"missing_s2={missing_s2:,}, "
         f"below_min_citations={below_min_citations:,}, "
-        f"below_min_year={below_min_year:,}, above_max_year={above_max_year:,}"
+        f"below_min_year={below_min_year:,}, above_max_year={above_max_year:,}, "
+        f"missing_publication_signal={missing_publication_signal:,}, "
+        f"missing_publication_type={missing_publication_type:,}, "
+        f"missing_include_keywords={missing_include_keywords:,}, "
+        f"excluded_keywords={excluded_keywords:,}"
     )
     return selected
 
@@ -1986,6 +2158,8 @@ def build_graph(
         "duplicate_edges": 0,
         "self_edges": 0,
         "references_breadth_cap": 0,
+        "reference_missing_include_keywords": 0,
+        "reference_excluded_keywords": 0,
         "expansion_breadth_cap": 0,
         "expansion_lookup_missing": 0,
         "expansion_fetch_missing": 0,
@@ -2003,6 +2177,8 @@ def build_graph(
         "expansion_fetch_count": 0,
         "target_node_budget_reached": False,
     }
+    reference_include_keywords = split_csv_option(args.reference_include_keywords)
+    reference_exclude_keywords = split_csv_option(args.reference_exclude_keywords)
 
     seed_node_ids: set[str] = set()
     seed_node_id_by_arxiv_id: dict[str, str] = {}
@@ -2088,6 +2264,22 @@ def build_graph(
                 skipped,
             ):
                 graph_stats["references_inspected"] += 1
+                if reference_include_keywords and not paper_matches_any_seed_keyword(
+                    {},
+                    cited_paper,
+                    reference_include_keywords,
+                ):
+                    skipped["reference_missing_include_keywords"] += 1
+                    continue
+
+                if reference_exclude_keywords and paper_matches_any_seed_keyword(
+                    {},
+                    cited_paper,
+                    reference_exclude_keywords,
+                ):
+                    skipped["reference_excluded_keywords"] += 1
+                    continue
+
                 source_id = node_id_for_paper(cited_paper)
                 if not source_id:
                     skipped["references_without_id"] += 1
@@ -2443,6 +2635,12 @@ def main() -> int:
         "s2_search_max_pages": args.s2_search_max_pages,
         "min_citations": args.min_citations,
         "max_seed_papers": args.max_seed_papers,
+        "seed_publication_types": args.seed_publication_types,
+        "require_seed_publication": args.require_seed_publication,
+        "seed_include_keywords": args.seed_include_keywords,
+        "seed_exclude_keywords": args.seed_exclude_keywords,
+        "reference_include_keywords": args.reference_include_keywords,
+        "reference_exclude_keywords": args.reference_exclude_keywords,
         "citation_depth": args.citation_depth,
         "max_references_per_paper": args.max_references_per_paper,
         "max_expansion_papers_per_depth": args.max_expansion_papers_per_depth,

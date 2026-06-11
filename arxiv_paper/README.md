@@ -160,6 +160,8 @@ This means reference nodes can represent non-arXiv papers unless filtered out.
 ### Important Filters
 
 - `--min-citations`: keeps only seed papers with at least this Semantic Scholar citation count.
+- `--seed-publication-types`: keeps only seed papers whose Semantic Scholar `publicationTypes` intersects the requested comma-separated list, such as `Conference,JournalArticle`.
+- `--require-seed-publication`: requires seed papers to have a Semantic Scholar publication signal such as a non-arXiv venue, non-preprint publication type, or DOI.
 - `--min-year` / `--max-year`: optional seed-paper publication year filters.
 - `--citation-depth`: number of backward reference hops to traverse from the selected seed papers. The default is `1`.
 - `--max-references-per-paper`: breadth cap for references inspected per expanded paper. The default `0` means no cap.
@@ -209,6 +211,128 @@ DOMAIN_REGEX='^(complexity_theory|cryptography|game_theory)$' \
 Set `DRY_RUN=1` to print commands without running them, `DOMAIN_LIMIT=N` to
 test the first `N` selected domains, and `SKIP_EXISTING=0` to rebuild existing
 per-domain outputs.
+
+Sparse S2 domains can return zero arXiv-backed candidates. The launcher now
+continues by default, retries failed domains with a broader query and then
+without the S2 field filter, and writes:
+
+- `succeeded_domains.tsv`
+- `failed_domains.tsv`
+
+Set `CONTINUE_ON_ERROR=0` to restore fail-fast behavior or
+`FALLBACK_ON_FAILURE=0` to disable fallback retries.
+
+Use `launch_dense_tcs_s2_graphs.sh` when you want a smaller number of much
+denser, more interconnected theoretical CS graphs. It defaults to one broad
+TCS-core graph with about 800 seed papers, a 10k node budget, reference depth
+2, and up to 80 references per expanded paper. The primary query is a short
+high-recall S2 query (`algorithms`), with fallback queries such as
+`computational complexity`, `cryptography`, `formal methods`, and `graph
+theory` if the primary query is too sparse:
+
+```bash
+./arxiv_paper/launch_dense_tcs_s2_graphs.sh
+```
+
+Run all overlapping dense TCS clusters:
+
+```bash
+CLUSTER_LIMIT=0 TARGET_TOTAL=6000 ./arxiv_paper/launch_dense_tcs_s2_graphs.sh
+```
+
+The dense launcher still builds a backward reference graph, so high fan-out
+parents appear when many selected child papers cite the same foundational
+paper. It does not fetch arbitrary forward citations for every parent node.
+
+Use `launch_deep_dense_tcs_s2_graphs.sh` for a much larger depth/breadth run.
+It delegates to the dense launcher and defaults to `DEPTH_PRESET=depth5`:
+750k node budget, reference depth 5, 50 references per expanded paper, 3k
+expansion frontier cap, and 350 seed papers. The seed count is intentionally
+lower than the 10k dense run so the first reference hops do not consume the
+whole node budget before deeper expansion can run:
+
+```bash
+./arxiv_paper/launch_deep_dense_tcs_s2_graphs.sh
+```
+
+Use the depth-10 preset for a deeper sampled crawl:
+
+```bash
+DEPTH_PRESET=depth10 ./arxiv_paper/launch_deep_dense_tcs_s2_graphs.sh
+```
+
+Or set `CITATION_DEPTH=10`; the launcher will infer `DEPTH_PRESET=depth10`
+unless you set `DEPTH_PRESET=custom`.
+
+For a still larger depth-10 run:
+
+```bash
+DEPTH_PRESET=depth10 \
+TARGET_NODE_COUNT=2500000 \
+TARGET_TOTAL=750 \
+MAX_REFERENCES_PER_PAPER=120 \
+MAX_EXPANSION_PAPERS_PER_DEPTH=8000 \
+./arxiv_paper/launch_deep_dense_tcs_s2_graphs.sh
+```
+
+Use `launch_deep_dense_tcs_theory_s2_graphs.sh` when the dense/deep TCS run is
+too broad. It defaults to the complexity/lower-bounds cluster, requires theory
+keywords in seed paper titles/abstracts, and excludes empirical/application
+keywords from both seed papers and referenced papers:
+
+```bash
+./arxiv_paper/launch_deep_dense_tcs_theory_s2_graphs.sh
+```
+
+Useful variants:
+
+```bash
+DEPTH_PRESET=depth10 ./arxiv_paper/launch_deep_dense_tcs_theory_s2_graphs.sh
+
+CLUSTER_REGEX='^(algorithms_complexity|complexity_lower_bounds|crypto_complexity|logic_verification_pl)$' \
+CLUSTER_LIMIT=0 \
+TARGET_TOTAL=800 \
+./arxiv_paper/launch_deep_dense_tcs_theory_s2_graphs.sh
+```
+
+The stricter launcher uses `--seed-include-keywords`,
+`--seed-exclude-keywords`, and `--reference-exclude-keywords`. Reference papers
+often have less metadata than seed papers, so reference filtering is mostly
+title-based when Semantic Scholar does not provide abstracts.
+
+Use `launch_premier_tcs_s2_graphs.sh` when you want broader TCS coverage while
+still biasing seeds toward published, well-cited papers. The topic list is
+inspired by premier theory venues: STOC/FOCS breadth, SODA/ESA algorithms,
+ICALP tracks, CCC complexity, LICS logic/semantics, SoCG geometry, PODC/SPAA
+distributed/parallel, plus COLT/TCC/IPCO-style adjacent theory. It defaults to
+all clusters, `DEPTH_PRESET=depth5`, `MIN_CITATIONS=50`, seed publication types
+`Conference,JournalArticle`, and a required seed publication signal:
+
+```bash
+./arxiv_paper/launch_premier_tcs_s2_graphs.sh
+```
+
+Useful variants:
+
+```bash
+DEPTH_PRESET=depth10 ./arxiv_paper/launch_premier_tcs_s2_graphs.sh
+
+CLUSTER_REGEX='^(approximation_hardness|computational_complexity|cryptography_foundations|learning_theory)$' \
+TARGET_TOTAL=400 \
+./arxiv_paper/launch_premier_tcs_s2_graphs.sh
+
+MIN_CITATIONS=100 \
+S2_PUBLICATION_TYPES=Conference \
+SEED_PUBLICATION_TYPES=Conference \
+./arxiv_paper/launch_premier_tcs_s2_graphs.sh
+```
+
+This launcher creates one graph directory per cluster under
+`data/arxiv_citation_graph_premier_tcs_depth*_s2/`. It uses short topic
+queries with fallback queries because Semantic Scholar bulk search can be very
+sparse for long theory-style query strings. If S2 metadata is missing
+publication types for legitimate papers, lower strictness with
+`SEED_PUBLICATION_TYPES=` or `REQUIRE_SEED_PUBLICATION=0`.
 
 ## Hugging Face Paper Pages Builder
 

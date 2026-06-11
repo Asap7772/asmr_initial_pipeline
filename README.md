@@ -1,3 +1,9 @@
+---
+title: graph_test
+app_file: app.py
+sdk: gradio
+sdk_version: 6.16.0
+---
 # ASMR Private
 
 Research utilities for filesystem-style question answering, retrieval/reranking experiments, Modal-hosted vLLM serving, and Tinker RL runs over synthetic filesystem tasks.

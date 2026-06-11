@@ -89,6 +89,12 @@ def args(**overrides: Any) -> argparse.Namespace:
         "s2_batch_size": 500,
         "s2_sleep": 0.0,
         "s2_concurrency": 1,
+        "seed_publication_types": None,
+        "require_seed_publication": False,
+        "seed_include_keywords": None,
+        "seed_exclude_keywords": None,
+        "reference_include_keywords": None,
+        "reference_exclude_keywords": None,
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -133,6 +139,85 @@ class BuildArxivCitationGraphTest(unittest.TestCase):
         self.assertEqual(candidate["authors"], ["Ada Lovelace"])
         self.assertEqual(candidate["primary_category"], "Computer Science")
         self.assertEqual(candidate["candidate_source"], "s2-search")
+
+    def test_seed_keyword_filters(self) -> None:
+        theory_entry = arxiv_entry("2101.00001")
+        empirical_entry = arxiv_entry("2101.00002")
+        unrelated_entry = arxiv_entry("2101.00003")
+        theory_paper = paper("T", "Circuit lower bounds for small-depth proof systems", 2021, 10)
+        empirical_paper = paper("E", "A dataset benchmark for neural image segmentation", 2021, 10)
+        unrelated_paper = paper("U", "A survey of database systems", 2021, 10)
+        s2_papers = {
+            "ARXIV:2101.00001": theory_paper,
+            "ARXIV:2101.00002": empirical_paper,
+            "ARXIV:2101.00003": unrelated_paper,
+        }
+
+        selected = graph_builder.select_seed_papers(
+            [theory_entry, empirical_entry, unrelated_entry],
+            s2_papers,
+            args(
+                min_citations=0,
+                max_seed_papers=0,
+                min_year=None,
+                max_year=None,
+                seed_include_keywords="lower bounds,proof systems",
+                seed_exclude_keywords="dataset,benchmark,neural,image segmentation",
+            ),
+            quiet_progress(),
+        )
+
+        self.assertEqual([(entry["arxiv_id"], paper["paperId"]) for entry, paper in selected], [("2101.00001", "T")])
+
+    def test_seed_publication_filters(self) -> None:
+        conference_entry = arxiv_entry("2101.00001")
+        journal_entry = arxiv_entry("2101.00002")
+        preprint_entry = arxiv_entry("2101.00003")
+        missing_signal_entry = arxiv_entry("2101.00004")
+
+        conference_paper = paper("C", "A Faster Approximation Algorithm", 2021, 30)
+        conference_paper["publicationTypes"] = ["Conference"]
+        conference_paper["venue"] = "ACM Symposium on Theory of Computing"
+
+        journal_paper = paper("J", "Circuit Lower Bounds", 2020, 20)
+        journal_paper["publicationTypes"] = ["JournalArticle"]
+        journal_paper["venue"] = "Journal of the ACM"
+
+        preprint_paper = paper("P", "An Unpublished Preprint", 2021, 100)
+        preprint_paper["publicationTypes"] = ["Preprint"]
+        preprint_paper["venue"] = "arXiv.org"
+
+        missing_signal_paper = paper("M", "No Publication Signal", 2021, 100)
+
+        self.assertTrue(graph_builder.paper_has_publication_signal(conference_paper))
+        self.assertTrue(graph_builder.paper_has_publication_signal(journal_paper))
+        self.assertFalse(graph_builder.paper_has_publication_signal(preprint_paper))
+
+        s2_papers = {
+            "ARXIV:2101.00001": conference_paper,
+            "ARXIV:2101.00002": journal_paper,
+            "ARXIV:2101.00003": preprint_paper,
+            "ARXIV:2101.00004": missing_signal_paper,
+        }
+
+        selected = graph_builder.select_seed_papers(
+            [conference_entry, journal_entry, preprint_entry, missing_signal_entry],
+            s2_papers,
+            args(
+                min_citations=0,
+                max_seed_papers=0,
+                min_year=None,
+                max_year=None,
+                seed_publication_types="Conference,JournalArticle",
+                require_seed_publication=True,
+            ),
+            quiet_progress(),
+        )
+
+        self.assertEqual(
+            [(entry["arxiv_id"], paper["paperId"]) for entry, paper in selected],
+            [("2101.00001", "C"), ("2101.00002", "J")],
+        )
 
     def test_retry_after_uses_custom_429_backoff_bounds(self) -> None:
         response = graph_builder.requests.Response()
@@ -311,6 +396,30 @@ class BuildArxivCitationGraphTest(unittest.TestCase):
         self.assertEqual(edge_pairs, {("s2:A", "s2:S")})
         self.assertEqual(skipped["target_node_budget"], 1)
         self.assertTrue(stats["target_node_budget_reached"])
+
+    def test_reference_keyword_exclude_skips_reference_nodes(self) -> None:
+        theory_reference = paper("A", "Proof complexity lower bounds", 2020, 10)
+        empirical_reference = paper("B", "A neural benchmark dataset", 2020, 10)
+        seed = paper(
+            "S",
+            "Seed",
+            2021,
+            500,
+            references=[theory_reference, empirical_reference],
+            arxiv_id="2101.00001",
+        )
+
+        nodes, edges, skipped, _ = graph_builder.build_graph(
+            [(arxiv_entry("2101.00001"), seed)],
+            args(citation_depth=1, reference_exclude_keywords="neural,benchmark,dataset"),
+            quiet_progress(),
+        )
+
+        node_ids = {node["node_id"] for node in nodes}
+        edge_pairs = {(edge["source"], edge["target"]) for edge in edges}
+        self.assertEqual(node_ids, {"s2:S", "s2:A"})
+        self.assertEqual(edge_pairs, {("s2:A", "s2:S")})
+        self.assertEqual(skipped["reference_excluded_keywords"], 1)
 
 
 if __name__ == "__main__":
